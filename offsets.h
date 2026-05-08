@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace lua_offsets
+namespace offsets
 {
     constexpr std::uintptr_t luaG_runerror        = 0x03f660f0; // Confident
     constexpr std::uintptr_t luaG_indexerror      = 0x03f662b4;// Less confident
