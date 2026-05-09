@@ -370,7 +370,6 @@ Thread status (`L+0x03`):
 ```
 0x03f7e9f8 = luaD_precall
 0x03f7ebcc = luaD_poscall
-0x03f7747c = luaV_execute
 0x03f67d40 = resume_execute_loop  (internal name unknown)
 ```
 
