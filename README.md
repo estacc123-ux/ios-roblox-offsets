@@ -48,6 +48,7 @@ L + 0x03 = status          (byte)
               0x01 = LUA_YIELD
               0x06 = LUA_BREAK      - Luau-specific, doesn't exist in standard Lua
               0x7f = running        - sentinel that blocks a thread from resuming itself
+L + 0x04 = memcat          (byte - memory category tag, passed to allocator)
 L + 0x08 = stacksize       (int - 0x2d on init; upper bytes still unknown)
 L + 0x0c = size_ci         (int - 8 on init)
 L + 0x18 = l_G             (global_State* - shared across all threads)
@@ -87,11 +88,17 @@ TString + 0x00 = tt      (byte - always LUA_TSTRING = 0x06)
 TString + 0x01 = memcat  (byte - memory category tag for the allocator)
 TString + 0x02 = marked  (byte - GC flags; bit 3 = |0x08 = pinned, never collected)
 TString + 0x03 = extra   (byte)
-TString + 0x08 = next    (GCObject* - next string in the interning hash chain)
+TString + 0x04 = atom    (int16 - fast-comparison integer ID; -1 = not yet assigned)
+TString + 0x06 = ???     (int16 - initialized to 0x8000; purpose unknown)
+TString + 0x08 = next    (TString* - next string in the interning hash chain)
 TString + 0x10 = hash    (uint - precomputed hash, used for table key lookup)
 TString + 0x14 = len     (uint - byte length, not counting the null terminator)
 TString + 0x18 = data[]  (inline chars - null terminated)
+
+sizeof(TString) = 0x18 + len + 1
 ```
+
+**On `atom`:** Luau assigns short integer IDs to commonly-used strings (metamethod names, keywords) for O(1) identity comparison. A fresh string from `luaS_newlstr` gets atom = -1 until `luaS_newatom` assigns one.
 
 **Permanently pinned strings** (both get `marked |= 8` in `luaE_newstate`):
 - `"not enough memory"` - for when the allocator gives up
@@ -153,17 +160,28 @@ Proto + 0x40 = Instruction* - code array, copied into ci->savedpc on call  [HIGH
 
 ---
 
-## Table (partial)
+## Table (complete)
 
 Luau tables are a hybrid array/hash structure. Small integer keys (1..n) go into a flat array part for speed; everything else lands in the hash part.
 
 ```cpp
-Table + 0x04 = lsizenode  (byte - log2 of the hash node array size)  [HIGH]
-Table + 0x20 = node       (LuaNode* - hash part)                      [HIGH]
-Table + 0x28 = metatable  (Table* - NULL if none)                     [HIGH]
+sizeof(Table) = 0x30 (48 bytes)
+
+Table + 0x00 = tt         (byte - always 0x07 = LUA_TTABLE)
+Table + 0x01 = memcat     (byte)
+Table + 0x02 = marked     (byte - GC color = g->gccolor & 3 on creation)
+Table + 0x03 = ???        (byte - zeroed on init)
+Table + 0x04 = lsizenode  (byte - log2 of hash node count; 0 = 1 slot = dummy)  [HIGH]
+Table + 0x05 = flags      (byte - 0xff on init; 1<<p = metamethod p is absent)  [HIGH]
+Table + 0x06 = ???        (8 bytes zeroed - likely sizearray int + padding)
+Table + 0x0e = ???        (2 bytes zeroed)
+Table + 0x10 = array*     (TValue* - array part; NULL on empty table)            [MED]
+Table + 0x18 = lastfree   (LuaNode* - last free hash slot; NULL on empty table)
+Table + 0x20 = node       (LuaNode* - hash part; &DAT_04ebdcd0 = dummy on empty) [HIGH]
+Table + 0x28 = metatable  (Table* - NULL if none)                                 [HIGH]
 ```
 
-Still missing: the array part pointer, `sizearray`, flags, and the GCObject common header. `luaH_new` (0x03f736b8) is the next stop for those.
+`flags = 0xff` on a new table means all metamethod-absent bits are set - the VM takes the fast path and skips metamethod lookups until a metatable is actually attached.
 
 ---
 
@@ -215,10 +233,14 @@ g + 0x08  = totalbytes  (size_t - total bytes currently allocated)
 g + 0x10  → g + 0x37   = UNKNOWN  (mainthread*, frealloc fn*, userdata ptr, panic fn*)
 
 g + 0x38  = strt.size   (uint - string interning table bucket count)
+g + 0x3c  = strt.nuse   (uint - number of interned strings currently in the table)
 g + 0x40  = strt.hash   (TString** - string interning bucket array)
+g + 0x54  = gccolor     (byte - current GC phase color; & 3 gives the mark bits
+                          used to initialize new objects and check write barriers)
 
 // GC gray lists, weak tables, etc. Needs GC function analysis to fill in.
-g + 0x48  → g + 0x31f  = UNKNOWN  (rootgc, gray, grayagain, weak, and friends)
+g + 0x48  → g + 0x53   = UNKNOWN
+g + 0x55  → g + 0x31f  = UNKNOWN  (rootgc, gray, grayagain, weak, and friends)
 
 // Metamethod name strings - 21 entries, 8 bytes each:
 g + 0x320 = tmname[0]   "__index"
@@ -390,19 +412,44 @@ Thread status values (`L+0x03`):
 0x03f66e08 = luaD_throw            C++ exception throw, not longjmp - see above
 ```
 
+### Memory
+
+```
+0x03f6d7e4 = luaM_newobject       (lua_State*, size_t, memcat) -> void*
+                                   Allocates a new GC object of the given size.
+
+0x03f6d648 = luaG_toobig          (lua_State*) - does not return
+                                   Called when a string exceeds 0x40000000 bytes.
+```
+
 ### Strings
 
 ```
-0x03f6ff1c = luaS_newlstr         (lua_State*, const char* s, size_t len)
+0x03f6fc34 = luaS_hash            (const char* s, size_t len) -> uint
+                                   Computes the string hash used for interning.
+
+0x03f6ff1c = luaS_newlstr         (lua_State*, const char* s, size_t len) -> TString*
+                                   Interns a string: looks it up in the global string
+                                   table, returns the existing TString if found,
+                                   otherwise allocates a new one and inserts it.
+                                   New strings get atom = -1 (unassigned).
+
 0x03f6fcc0 = luaS_resize          (lua_State*, int newsize)
+                                   Resizes the string interning hash table.
 ```
 
 ### Tables
 
 ```
 0x03f736b8 = luaH_new             (lua_State*, int narray, int nhash) -> Table*
-                                   Next analysis target - will fill in the rest
-                                   of the Table layout.
+                                   Allocates a new empty Table (0x30 bytes).
+                                   Sets lsizenode=0 (1 dummy slot), flags=0xff,
+                                   node = dummy node sentinel, metatable = NULL.
+                                   Calls luaH_resizearray / luaH_resizehash if
+                                   narray or nhash are > 0.
+
+0x03f7376c = luaH_resizearray     (lua_State*, Table*, int narray)
+0x03f7387c = luaH_resizehash      (lua_State*, Table*, int nhash)
 
 0x03f73a8c = luaH_getstr          (Table*, TString*) -> TValue*
                                    Raw hash lookup by string key. Returns a pointer
@@ -471,7 +518,12 @@ Thread status values (`L+0x03`):
 DAT_04ebdbc0 = Static nil TValue sentinel. Returned by luaH_getstr and luaT_gettmbyobj
                on a miss. Don't write to this address.
 
+DAT_04ebdcd0 = Dummy LuaNode sentinel. Used as Table->node for empty tables with no
+               hash part. Don't write to this address either.
+
 DAT_05dae828 = Vector library luaL_Reg[] function table.
+
+DAT_05dadd88 = lua_exception vtable.
 
 DAT_05fabec8 = Global feature flag byte. Checked at the top of lua_resume and in the
                resume loop. When it's 0x01, coroutine-extended behavior is enabled.
@@ -486,14 +538,15 @@ The map is solid but there are still gaps worth filling.
 
 | Target | Why it matters |
 |---|---|
-| `luaH_new` (0x03f736b8) | Rest of Table layout: array*, sizearray, flags, GCObject header |
 | Outer `lua_newstate` (xref callers of 0x03f6fac4) | Closes `g+0x10`→`g+0x37`: mainthread, frealloc, ud, panic |
 | `luaV_execute` (0x03f7747c) | Full Proto layout + all opcode handlers - big function, worth it |
-| `luaS_newlstr` (0x03f6ff1c) | Might finally explain what `TValue+0x08` is for |
 | GC functions (`luaC_step` etc.) | Closes `g+0x48`→`g+0x31f` - the whole GC list block |
+| `TValue+0x08` semantic meaning | Still unresolved - try a table set function or luaV_execute |
 | `g+0x488`→`g+0x497` | 16 mystery bytes between `mt[]` and the registry |
-| Closure+0x03 | Confirm numparams vs nupvalues |
-| Proto+0x04 | Confirm is_vararg vs numparams |
+| `Closure+0x03` | Confirm numparams vs nupvalues |
+| `Proto+0x04` | Confirm is_vararg vs numparams |
+| `Table+0x03`, `Table+0x06`→`+0x17` | Fill remaining Table fields (sizearray, array*) |
+| `TString+0x06` | Confirm meaning of the 0x8000 sentinel |
 
 ---
 
