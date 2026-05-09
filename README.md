@@ -1,5 +1,8 @@
 This took awhile but i think this is enough info to release to the public. Will update on the android offsets later in the future just been busy with on this and other stuff.
 
+Currect Version: (2.720.1164)
+
+Download IOS Roblox here: https://decrypt.day/app/id431946152
 
 ### lua_State (L)
 ```cpp
