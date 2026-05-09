@@ -1,3 +1,6 @@
+This took awhile but i think this is enough info to release to the public. Will update on the android offsets later in the future just been busy with on this and other stuff.
+
+
 ### lua_State (L)
 ```cpp
 L + 0x00 = unknown
