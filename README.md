@@ -12,235 +12,235 @@
 
 ## How This Was Done
 
-If you want to verify anything here or pick up where this left off, here's the actual approach.
-
 **1. String cross-references**  
 Ghidra lets you find every piece of code that touches a string literal. Strings like `"attempt to call"`, `"__index"`, `"not enough memory"`, and `"13lua_exception"` are anchor points. Find the string, find the function that uses it, read what it does to nearby memory, and you've got struct offsets basically for free.
 
 **2. Known-value anchors in global_State**  
 The `tmname[]` and `ttname[]` arrays are a gift. They hold interned strings for every metamethod (`"__index"`, `"__call"`, etc.) and type name (`"nil"`, `"string"`, etc.) in a fixed order defined by the Luau source. Find any one entry and you've pinned the entire array - and by extension, the base address of `global_State`.
 
-**3. luaE_newstate as a free layout map**  
-The state initializer writes to basically every important field at startup: `L->gt`, `g->registry`, `g->strt`, the GC threshold, all of it. Just read the store sequence and you get a mostly-complete layout of both `lua_State` and `global_State` without breaking a sweat.
+**3. lua_newstate / luaE_newstate as free layout maps**  
+The state initializers write to basically every important field at startup. `lua_newstate` gives you the allocator, userdata, panic handler, mainthread pointer, GC parameters, and the combined allocation size. `luaE_newstate` fills in `_G`, the registry, metamethod strings, and the pinned error strings. Just read the store sequences.
 
 **4. Store-sequence analysis**  
-When a known function allocates a struct and immediately fills it in (like `luaD_precall` pushing a new `CallInfo`), the stores happen in field order. Reading them gives you the layout directly. This is also how we caught that a lot of public references have `CallInfo` wrong - `func` is not at `ci+0x00` in this binary. More on that below.
+When a known function allocates a struct and immediately fills it in (like `luaD_precall` pushing a new `CallInfo`), the stores happen in field order. Reading them gives you the layout directly. This is also how we caught that a lot of public references have `CallInfo` wrong - `func` is not at `ci+0x00` in this binary.
 
 **5. C++ exception type_info**  
-Roblox's iOS build throws C++ exceptions for Lua errors instead of using `longjmp`. The `__cxa_throw` call passes a `std::type_info*`, which contains an Itanium-mangled class name string. Follow the pointer, read the string, and you get the class name and layout handed to you. That's how we confirmed `lua_exception`.
+Roblox's iOS build throws C++ exceptions for Lua errors instead of using `longjmp`. The `__cxa_throw` call passes a `std::type_info*`, which contains an Itanium-mangled class name string. Follow the pointer, read the string, and you get the class name and layout handed to you.
 
-**Confidence levels - please read these:**
+**Confidence levels:**
 - `[HIGH]` - seen directly in the decompiler, no guessing involved
 - `[MED]` - inferred from context, consistent with Luau source patterns
 - `[LOW]` - the field exists, but what it actually means is a best guess
 
 ---
 
+## Combined Allocation Layout
+
+`lua_newstate` allocates **one contiguous block of 0x4710 bytes** for both the main thread state and the global state. They are not separate heap allocations.
+
+```
+[base + 0x0000] = lua_State    (main thread)
+[base + 0x0080] = global_State
+[base + 0x4710] = end of allocation
+```
+
+`L->l_G` (at L+0x18) is set to `base + 0x80`, confirming the split. Coroutines have their own separately allocated `lua_State` but share the same `global_State` via their own `l_G` pointer.
+
+---
+
 ## lua_State (L)
 
-The per-thread VM state. Every coroutine gets its own `lua_State`. They all share one `global_State` via `l_G`.
-
 ```cpp
-L + 0x00 = unknown
-L + 0x01 = tt / type       (byte)
-L + 0x03 = status          (byte)
-              0x00 = suspended / OK  - can be resumed
+L + 0x00 = tt          (byte - 0x0a = LUA_TTHREAD; lua_State is a GC object)
+L + 0x01 = memcat      (byte - GC object memory category, 0 for main thread)
+L + 0x02 = marked      (byte - GC flags; 9 = 0b00001001 on main thread:
+                                bit 0 = current GC color,
+                                bit 3 = fixed/pinned, not in GC sweep list)
+L + 0x03 = status      (byte)
+              0x00 = suspended / OK
               0x01 = LUA_YIELD
-              0x06 = LUA_BREAK      - Luau-specific, doesn't exist in standard Lua
-              0x7f = running        - sentinel that blocks a thread from resuming itself
-L + 0x04 = memcat          (byte - memory category tag, passed to allocator)
-L + 0x08 = stacksize       (int - 0x2d on init; upper bytes still unknown)
-L + 0x0c = size_ci         (int - 8 on init)
-L + 0x18 = l_G             (global_State* - shared across all threads)
-L + 0x20 = stack_last      (StkId - one past the last valid stack slot)
-L + 0x28 = top             (StkId - current top of stack)
-L + 0x30 = stack           (StkId - stack allocation base)
-L + 0x38 = ci              (CallInfo* - current call frame)
-L + 0x40 = base            (StkId - current frame base / first arg)
-L + 0x58 = end_ci          (CallInfo* - one past the last CallInfo slot)
-L + 0x60 = base_ci         (CallInfo* - first CallInfo / bottom of the call stack)
-L + 0x70 = gt              (Table* - the _G global environment table)
+              0x06 = LUA_BREAK      (Luau-specific)
+              0x7f = running
+L + 0x04 = active_memcat  (byte - memcat used for new objects allocated on
+                            behalf of this thread; distinct from L+0x01)
+L + 0x08 = stacksize   (int)
+L + 0x0c = size_ci     (int - 8 on init)
+L + 0x18 = l_G         (global_State*)
+L + 0x20 = stack_last  (StkId)
+L + 0x28 = top         (StkId)
+L + 0x30 = stack       (StkId - allocation base)
+L + 0x38 = ci          (CallInfo*)
+L + 0x40 = base        (StkId - current frame base)
+L + 0x58 = end_ci      (CallInfo*)
+L + 0x60 = base_ci     (CallInfo*)
+L + 0x70 = gt          (Table* - _G)
+L + 0x78 = ???         (pointer - NULL on init)
 ```
+
+**Note:** Earlier notes listed L+0x01 as "tt/type". That was wrong. Like all Luau GC objects, `tt` is at +0x00. L+0x01 is `memcat` (the GC object's own memory category). L+0x04 is the *active* memcat used when allocating new objects on this thread's behalf — they are different things.
 
 ---
 
 ## TValue (0x10 bytes)
 
-Everything on the Lua stack is a `TValue`. The type tag at `+0x0c` tells you what the 8-byte value union at `+0x00` actually is - a pointer, a double, an int, whatever.
-
 ```cpp
-TValue + 0x00 = value union  (8 bytes - interpret based on tt)
-TValue + 0x08 = extra        (4 bytes - confirmed real field, purpose unresolved;
-                               probably a hash cache or spare slot)
-TValue + 0x0c = tt           (int - type tag, see Type Tags section)
+TValue + 0x00 = value union  (8 bytes)
+TValue + 0x08 = extra        (4 bytes - confirmed real field, purpose still unknown)
+TValue + 0x0c = tt           (int - type tag)
 ```
 
-**On `TValue+0x08`:** This is not padding. It shows up as a distinct field in the `LuaNode` layout, sitting between `key.value` and `key.tt`. No function analyzed so far explicitly reads or writes it for plain stack TValues, so what it does in that context is still open. It's there though.
+`TValue+0x08` is not padding — it appears as a distinct field in `LuaNode` key layout. No analyzed function reads or writes it for plain stack TValues yet.
 
 ---
 
 ## TString
 
-Interned string object. The character data lives inline right after the header - no separate heap allocation for the string contents.
-
 ```cpp
-TString + 0x00 = tt      (byte - always LUA_TSTRING = 0x06)
-TString + 0x01 = memcat  (byte - memory category tag for the allocator)
-TString + 0x02 = marked  (byte - GC flags; bit 3 = |0x08 = pinned, never collected)
+TString + 0x00 = tt      (byte - 0x06 = LUA_TSTRING)
+TString + 0x01 = memcat  (byte)
+TString + 0x02 = marked  (byte - bit 3 = pinned)
 TString + 0x03 = extra   (byte)
-TString + 0x04 = atom    (int16 - fast-comparison integer ID; -1 = not yet assigned)
-TString + 0x06 = ???     (int16 - initialized to 0x8000; purpose unknown)
-TString + 0x08 = next    (TString* - next string in the interning hash chain)
-TString + 0x10 = hash    (uint - precomputed hash, used for table key lookup)
-TString + 0x14 = len     (uint - byte length, not counting the null terminator)
-TString + 0x18 = data[]  (inline chars - null terminated)
+TString + 0x04 = atom    (int16 - fast-comparison ID; -1 = not yet assigned)
+TString + 0x06 = ???     (int16 - initialized to 0x8000)
+TString + 0x08 = next    (TString* - next in interning hash chain)
+TString + 0x10 = hash    (uint)
+TString + 0x14 = len     (uint)
+TString + 0x18 = data[]  (inline chars, null terminated)
 
 sizeof(TString) = 0x18 + len + 1
 ```
 
-**On `atom`:** Luau assigns short integer IDs to commonly-used strings (metamethod names, keywords) for O(1) identity comparison. A fresh string from `luaS_newlstr` gets atom = -1 until `luaS_newatom` assigns one.
-
-**Permanently pinned strings** (both get `marked |= 8` in `luaE_newstate`):
-- `"not enough memory"` - for when the allocator gives up
-- `"error in error handling"` - for when things go spectacularly wrong
+Permanently pinned strings (marked |= 8 in luaE_newstate):
+- `"not enough memory"`
+- `"error in error handling"`
 
 ---
 
 ## CallInfo (0x28 bytes)
 
-One `CallInfo` per active call frame. Stored in a pre-allocated array between `base_ci` and `end_ci`, grown via `luaD_growCI` when needed.
-
-> ⚠️ **A lot of public references get this wrong.** Many list `func` at `ci+0x00`. That is incorrect for this binary. The layout below was read directly from `luaD_precall`'s store sequence into a freshly allocated `CallInfo` - there's no inference here.
+> ⚠️ Many public references list `func` at `ci+0x00`. That is wrong for this binary. Layout read directly from `luaD_precall`'s store sequence.
 
 ```cpp
-ci + 0x00 = top      (StkId - frame ceiling: func + numparams * 0x10)   [HIGH]
+ci + 0x00 = top      (StkId)                                             [HIGH]
 ci + 0x08 = savedpc  (Instruction* - 0 on C call, Proto->code on Lua)   [HIGH]
-ci + 0x10 = base     (StkId - first arg / frame base = func + 0x10)     [HIGH]
-ci + 0x18 = func     (StkId - pointer to the function TValue on stack)  [HIGH]
-ci + 0x20 = nresults (int - expected result count; -1 = LUA_MULTRET)    [HIGH]
-ci + 0x24 = flags    (int - bit 0: CIST_YIELDABLE set on resume,
-                             bit 2: has upvalues set by precall)         [MED]
+ci + 0x10 = base     (StkId)                                             [HIGH]
+ci + 0x18 = func     (StkId - ptr to function TValue on stack)           [HIGH]
+ci + 0x20 = nresults (int - -1 = LUA_MULTRET)                            [HIGH]
+ci + 0x24 = flags    (int - bit 0: CIST_YIELDABLE, bit 2: has upvalues)  [MED]
 ```
 
 ---
 
 ## Closure (partial)
 
-Lua closures and C closures share the same header. `isC` at `+0x05` is the dividing line.
-
 ```cpp
 Closure + 0x00 = tt         (byte - 0x08 = LUA_TFUNCTION)
 Closure + 0x01 = memcat     (byte)
-Closure + 0x02 = marked     (byte - GC flags)
-Closure + 0x03 = numparams  (byte - used by precall for stack sizing)   [MED - could be nupvalues]
+Closure + 0x02 = marked     (byte)
+Closure + 0x03 = numparams  (byte)                    [MED - could be nupvalues]
 Closure + 0x04 = unknown    (byte)
-Closure + 0x05 = isC        (byte - 0 = Lua closure, nonzero = C)      [HIGH]
-Closure + 0x18 = Proto*     (Lua) / lua_CFunction (C)                   [HIGH]
-Closure + 0x28 = cont*      (C closures only - continuation fn pointer,
-                              NULL = this function cannot yield)         [HIGH]
+Closure + 0x05 = isC        (byte - 0 = Lua, nonzero = C)               [HIGH]
+Closure + 0x18 = Proto* / lua_CFunction                                  [HIGH]
+Closure + 0x28 = cont*      (C only - continuation fn; NULL = not yieldable) [HIGH]
 ```
-
-The `cont` field at `+0x28` is how coroutine-aware C functions like `pcall` hand control back after a yield. If it's null, the function is not yield-safe and the VM knows it.
 
 ---
 
 ## Proto (partial)
 
-The compiled function prototype. All closures from the same function body share one `Proto`. It holds the bytecode, constants, upvalue descriptors, and debug info.
-
 ```cpp
-Proto + 0x04 = byte         - is_vararg or numparams (if 0: L->top = ci->top)  [MED]
-Proto + 0x05 = byte         - maxstacksize, used for the nil-fill loop in precall  [HIGH]
-Proto + 0x08 = ptr          - upvalue-related (0 = skip upvalue init)  [LOW]
-Proto + 0x10 = ptr          - upvalue-related (0 = skip upvalue init)  [LOW]
-Proto + 0x40 = Instruction* - code array, copied into ci->savedpc on call  [HIGH]
+Proto + 0x04 = byte  - is_vararg or numparams (if 0: L->top = ci->top)  [MED]
+Proto + 0x05 = byte  - maxstacksize                                       [HIGH]
+Proto + 0x08 = ptr   - upvalue-related (0 = skip)                        [LOW]
+Proto + 0x10 = ptr   - upvalue-related (0 = skip)                        [LOW]
+Proto + 0x40 = Instruction* - code array                                  [HIGH]
 ```
-
-`luaV_execute` is the next target for the rest of Proto - constants array, nested protos, line info, all of it.
 
 ---
 
 ## Table (complete)
 
-Luau tables are a hybrid array/hash structure. Small integer keys (1..n) go into a flat array part for speed; everything else lands in the hash part.
-
 ```cpp
-sizeof(Table) = 0x30 (48 bytes)
+sizeof(Table) = 0x30
 
-Table + 0x00 = tt         (byte - always 0x07 = LUA_TTABLE)
+Table + 0x00 = tt         (byte - 0x07 = LUA_TTABLE)
 Table + 0x01 = memcat     (byte)
 Table + 0x02 = marked     (byte - GC color = g->gccolor & 3 on creation)
 Table + 0x03 = ???        (byte - zeroed on init)
-Table + 0x04 = lsizenode  (byte - log2 of hash node count; 0 = 1 slot = dummy)  [HIGH]
-Table + 0x05 = flags      (byte - 0xff on init; 1<<p = metamethod p is absent)  [HIGH]
-Table + 0x06 = ???        (8 bytes zeroed - likely sizearray int + padding)
+Table + 0x04 = lsizenode  (byte - log2 hash node count; 0 = 1 dummy slot) [HIGH]
+Table + 0x05 = flags      (byte - 0xff on init; 1<<p = metamethod p absent) [HIGH]
+Table + 0x06 = ???        (8 bytes zeroed - likely sizearray + padding)
 Table + 0x0e = ???        (2 bytes zeroed)
-Table + 0x10 = array*     (TValue* - array part; NULL on empty table)            [MED]
-Table + 0x18 = lastfree   (LuaNode* - last free hash slot; NULL on empty table)
-Table + 0x20 = node       (LuaNode* - hash part; &DAT_04ebdcd0 = dummy on empty) [HIGH]
-Table + 0x28 = metatable  (Table* - NULL if none)                                 [HIGH]
+Table + 0x10 = array*     (TValue* - array part; NULL on empty table)     [MED]
+Table + 0x18 = lastfree   (LuaNode* - NULL on empty table)
+Table + 0x20 = node       (LuaNode* - &DAT_04ebdcd0 dummy on empty table) [HIGH]
+Table + 0x28 = metatable  (Table* - NULL if none)                          [HIGH]
 ```
-
-`flags = 0xff` on a new table means all metamethod-absent bits are set - the VM takes the fast path and skips metamethod lookups until a metatable is actually attached.
 
 ---
 
 ## LuaNode (0x20 bytes)
 
-Each slot in the table hash part is a `LuaNode` - a value TValue and a key TValue packed into 32 bytes. The key's type tag and the next-chain offset are packed together into a single `uint32` at the end to save space.
-
 ```cpp
-// Value:
 node + 0x00 = val.value  (8 bytes)
-node + 0x08 = val.extra  (4 bytes - TValue+0x08 field)
-node + 0x0c = val.tt     (int - value type tag)
-
-// Key (packed):
-node + 0x10 = key.value  (8 bytes - for strings, this is the TString*)
-node + 0x18 = key.extra  (4 bytes - TValue+0x08 field)
-node + 0x1c = packed     (uint32:
-                           bits  [3:0] = key type tag
-                           bits [31:4] = next-node offset, signed, in LuaNode units)
+node + 0x08 = val.extra  (4 bytes)
+node + 0x0c = val.tt     (int)
+node + 0x10 = key.value  (8 bytes)
+node + 0x18 = key.extra  (4 bytes)
+node + 0x1c = packed uint32:
+                bits  [3:0] = key.tt
+                bits [31:4] = next offset (signed, in LuaNode units)
 ```
 
-**Hash lookup** (from `luaH_getstr`):
-```
-bucket = TString->hash & ((1 << Table->lsizenode) - 1)
-node   = Table->node + bucket
-```
-Chain ends when `node+0x1c < 0x10` - next is 0 and the key is nil, meaning you've hit an empty slot or the end of the chain.
+Hash lookup: `bucket = TString->hash & ((1 << lsizenode) - 1)`.  
+Chain end: `node+0x1c < 0x10` (next=0 and key=nil).
 
 ---
 
 ## Userdata (partial)
 
 ```cpp
-Userdata + 0x08 = metatable*  (Table* - NULL if none)  [HIGH]
+Userdata + 0x08 = metatable*  (Table*)  [HIGH]
 ```
 
 ---
 
 ## global_State (g)
 
-Shared across all threads. Access it via `L->l_G`.
+Access via `L->l_G`. Starts at `L+0x80` in the main-thread allocation block.
 
 ```cpp
-g + 0x00  = nextgc      (size_t - GC threshold; set to totalbytes * 4 on init)
-g + 0x08  = totalbytes  (size_t - total bytes currently allocated)
+g + 0x00  = nextgc      (size_t - GC threshold; set to totalbytes*4 by luaE_newstate)
+g + 0x08  = totalbytes  (size_t - 0x4710 on init = size of combined LG block)
 
-// Written by the outer lua_newstate before luaE_newstate runs.
-// lua_newstate itself hasn't been found yet so this gap is still dark.
-g + 0x10  → g + 0x37   = UNKNOWN  (mainthread*, frealloc fn*, userdata ptr, panic fn*)
+// Written by lua_newstate:
+g + 0x10  = frealloc    (lua_Alloc - allocator function pointer)
+g + 0x18  = ud          (void* - allocator userdata)
+g + 0x20  = panic       (lua_CFunction - unprotected error handler; NULL on init)
+g + 0x28  = ???         (8 bytes, zeroed)
+g + 0x30  = ???         (8 bytes, zeroed)
 
-g + 0x38  = strt.size   (uint - string interning table bucket count)
-g + 0x3c  = strt.nuse   (uint - number of interned strings currently in the table)
-g + 0x40  = strt.hash   (TString** - string interning bucket array)
-g + 0x54  = gccolor     (byte - current GC phase color; & 3 gives the mark bits
-                          used to initialize new objects and check write barriers)
+g + 0x38  = strt.size   (uint - bucket count; 0 on init, 0x20 after luaS_resize)
+g + 0x3c  = strt.nuse   (uint - interned string count)
+g + 0x40  = strt.hash   (TString**)
 
-// GC gray lists, weak tables, etc. Needs GC function analysis to fill in.
-g + 0x48  → g + 0x53   = UNKNOWN
-g + 0x55  → g + 0x31f  = UNKNOWN  (rootgc, gray, grayagain, weak, and friends)
+// GC parameters (written by lua_newstate):
+g + 0x48  = gcpause     (uint32 - 200 on init)
+g + 0x4c  = gcstepmul   (uint32 - 200 on init)
+g + 0x50  = ???         (uint32 - 0x400 on init; possibly gcstepsize)
+g + 0x54  = gccolor     (byte - 9 on init; bits[1:0] = mark color, bit[3] = GC flag)
+g + 0x55  = ???         (byte - zeroed)
+
+// GC lists (partially mapped from lua_newstate init):
+g + 0x58  = ???         (GC list anchor - g+0x68 and g+0x70 both point here on init)
+g + 0x68  = ???         (pointer - initialized to &g+0x58)
+g + 0x70  = ???         (pointer - initialized to &g+0x58)
+
+// g+0x48 through g+0x31f still partially unknown
+// (rootgc, gray, grayagain, weak tables etc. - needs luaC_step analysis)
+
+g + 0x310 = mainthread  (lua_State*)
+g + 0x318 = ???         (8 bytes between mainthread and tmname[0])
 
 // Metamethod name strings - 21 entries, 8 bytes each:
 g + 0x320 = tmname[0]   "__index"
@@ -279,50 +279,51 @@ g + 0x410 = ttname[9]   "userdata"   (heavy)
 g + 0x418 = ttname[10]  "thread"
 g + 0x420 = ttname[11]  "buffer"
 
-// Per-type metatables - 12 entries, 8 bytes each (NULL = not set):
+// Per-type metatables - 12 entries, 8 bytes each:
 g + 0x428 = mt[0]   LUA_TNIL
 g + 0x430 = mt[1]   LUA_TBOOLEAN
 g + 0x438 = mt[2]   LUA_TLIGHTUSERDATA
 g + 0x440 = mt[3]   LUA_TNUMBER
 g + 0x448 = mt[4]   LUA_TINTEGER
 g + 0x450 = mt[5]   LUA_TVECTOR
-g + 0x458 = mt[6]   LUA_TSTRING      // almost always non-null in Roblox (string library)
-g + 0x460 = mt[7]   LUA_TTABLE       // fallback only - tables have their own mt field
+g + 0x458 = mt[6]   LUA_TSTRING      (almost always non-null in Roblox)
+g + 0x460 = mt[7]   LUA_TTABLE       (fallback - tables use own metatable field)
 g + 0x468 = mt[8]   LUA_TFUNCTION
-g + 0x470 = mt[9]   LUA_TUSERDATA    // fallback only - userdata has its own mt field
+g + 0x470 = mt[9]   LUA_TUSERDATA    (fallback - userdata uses own metatable field)
 g + 0x478 = mt[10]  LUA_TTHREAD
 g + 0x480 = mt[11]  LUA_TBUFFER
-// mt[] ends at g+0x488
 
-g + 0x488 → g + 0x497 = UNKNOWN  (16 bytes between mt[] and the registry, still unclear)
+g + 0x488 = ???     (4 bytes, zeroed)
+g + 0x490 = ???     (8 bytes, zeroed)
+g + 0x494 = ???     (4 bytes, zeroed)
 
-// The Lua registry, stored inline as a TValue:
+// Registry (inline TValue):
 g + 0x498 = registry.value  (Table*)
-g + 0x4a4 = registry.tt     (int - always 7 = LUA_TTABLE)
-```
+g + 0x4a4 = registry.tt     (int - 7 = LUA_TTABLE)
 
-**How `luaT_gettmbyobj` uses `mt[]`:** For TABLE and USERDATA it checks the per-object metatable directly (Table+0x28, Userdata+0x08). For everything else it falls back to `g->mt[tt]`. So `g->mt[7]` and `g->mt[9]` only get hit if an object has no metatable of its own.
+g + 0x4a8 = ???     (uint32 - 0x70000000 on init; possibly a memory cap or
+                     Roblox-specific sandbox limit)
+```
 
 ---
 
 ## Error / Exception Mechanism
 
-Standard Lua uses `setjmp`/`longjmp` for error handling. Roblox's iOS build does not - it uses **C++ exceptions** instead, which play nicer with Objective-C and Swift frames on ARM64.
+Roblox's iOS build uses **C++ exceptions**, not `setjmp`/`longjmp`.
 
 ```cpp
 // class lua_exception : public std::exception
-// ABI: __cxxabiv1::__si_class_type_info (single inheritance, global namespace)
 
 exception_object + 0x00 = vtable*     → DAT_05dadd88
-exception_object + 0x08 = lua_State*  (the thread that threw)
-exception_object + 0x10 = int         (LUA_ERR* error code)
+exception_object + 0x08 = lua_State*
+exception_object + 0x10 = int         (LUA_ERR* code)
 
-05dadd60   = lua_exception typeinfo object
-04ebd59c   = "13lua_exception"  (Itanium-mangled; demangles to just: lua_exception)
+05dadd60     = lua_exception typeinfo
+04ebd59c     = "13lua_exception" (Itanium mangled)
 DAT_05dadd88 = lua_exception vtable
 ```
 
-`luaD_throw` (0x03f66e08) allocates via `__cxa_allocate_exception(0x18)`, fills the three fields, and calls `__cxa_throw`. Catch sites in `lua_resume` and `luaD_pcall` use normal `try/catch` blocks. There are no `setjmp` error jump buffers anywhere in `lua_State` - if you're looking for one, stop looking.
+`luaD_throw` allocates via `__cxa_allocate_exception(0x18)` and calls `__cxa_throw`. No `setjmp` buffers exist in `lua_State`.
 
 ---
 
@@ -333,14 +334,14 @@ DAT_05dadd88 = lua_exception vtable
 0x01 = LUA_TBOOLEAN
 0x02 = LUA_TLIGHTUSERDATA
 0x03 = LUA_TNUMBER
-0x04 = LUA_TINTEGER    (Luau-specific - a distinct integer type, not just a float)
-0x05 = LUA_TVECTOR     (Luau-specific - 3-component float vector)
+0x04 = LUA_TINTEGER    (Luau-specific)
+0x05 = LUA_TVECTOR     (Luau-specific)
 0x06 = LUA_TSTRING
 0x07 = LUA_TTABLE
 0x08 = LUA_TFUNCTION
 0x09 = LUA_TUSERDATA
 0x0a = LUA_TTHREAD
-0x0b = LUA_TBUFFER     (Luau-specific - typed byte buffer)
+0x0b = LUA_TBUFFER     (Luau-specific)
 ```
 
 ---
@@ -348,17 +349,17 @@ DAT_05dadd88 = lua_exception vtable
 ## Error Codes
 
 ```cpp
-0x02 = LUA_ERRRUN   runtime error
-0x04 = LUA_ERRMEM   memory allocation failure
-0x05 = LUA_ERRERR   error while handling an error (yes, that's a thing)
+0x02 = LUA_ERRRUN
+0x04 = LUA_ERRMEM
+0x05 = LUA_ERRERR
 ```
 
-Thread status values (`L+0x03`):
+Thread status (`L+0x03`):
 ```cpp
 0x00 = OK / suspended
 0x01 = LUA_YIELD
 0x06 = LUA_BREAK    (Luau-specific)
-0x7f = running      (if you see this, the thread is already going - don't resume it)
+0x7f = running
 ```
 
 ---
@@ -366,142 +367,89 @@ Thread status values (`L+0x03`):
 ## Functions
 
 ### VM Core
-
 ```
-0x03f7e9f8 = luaD_precall         (lua_State*, StkId func, int nresults)
-                                   Sets up a new call frame. Pushes a CallInfo,
-                                   initializes the frame, then either runs the C
-                                   function directly (returns 1) or returns 0 so the
-                                   caller knows to run luaV_execute.
-
-0x03f7ebcc = luaD_poscall         (lua_State*, StkId firstResult)
-                                   Tears down a call frame. Copies results back,
-                                   pops the CallInfo, restores L->base and L->top.
-
-0x03f7747c = luaV_execute         (lua_State*)
-                                   The bytecode interpreter. The big one.
-
-0x03f67d40 = resume_execute_loop  (lua_State*)
-                                   Post-resume execution driver. Runs luaV_execute
-                                   for Lua frames, calls C continuations for C frames,
-                                   until the coroutine yields or finishes.
-                                   (Internal name - actual symbol unknown.)
+0x03f7e9f8 = luaD_precall
+0x03f7ebcc = luaD_poscall
+0x03f7747c = luaV_execute
+0x03f67d40 = resume_execute_loop  (internal name unknown)
 ```
 
 ### Thread / State
-
 ```
-0x03f675c8 = lua_resume           (lua_State* L, StkId func)
+0x03f6f7c8 = lua_newstate         (lua_Alloc f, void* ud) -> lua_State*
+                                   Allocates 0x4710 byte combined block.
+                                   Writes frealloc/ud/panic/gcpause(200)/
+                                   gcstepmul(200)/mainthread into global_State.
+                                   Calls luaD_rawrunprotected(L, luaE_newstate).
+                                   Returns NULL on failure.
+
+0x03f675c8 = lua_resume
 0x03f6523c = lua_closethread
-0x03f6f478 = luaD_initstack       (lua_State* L, lua_State* mainthread)
-0x03f6fac4 = luaE_newstate        (lua_State*)
-                                   Initializes a freshly allocated state: creates _G
-                                   and the registry, interns metamethod strings, pins
-                                   the two permanent error strings, sets GC threshold.
-                                   The outer lua_newstate that allocates global_State
-                                   and writes frealloc/ud/panic hasn't been found yet.
+0x03f6f478 = luaD_initstack
+0x03f6fac4 = luaE_newstate        (called under protection by lua_newstate)
+0x03f66d48 = luaD_rawrunprotected (lua_State*, lua_CFunction, void*)
+0x03f6fb88 = lua_freestate        (cleanup on init failure)
 ```
 
 ### Call Stack
-
 ```
 0x03f670a8 = luaD_growCI
 0x03f67010 = luaD_reallocCI
-0x03f66e4c = luaD_growstack        [MED - called in precall on stack overflow]
+0x03f66e4c = luaD_growstack        [MED]
 0x03f67454 = luaD_seterrorobj
-0x03f66e08 = luaD_throw            C++ exception throw, not longjmp - see above
+0x03f66e08 = luaD_throw
 ```
 
 ### Memory
-
 ```
 0x03f6d7e4 = luaM_newobject       (lua_State*, size_t, memcat) -> void*
-                                   Allocates a new GC object of the given size.
-
-0x03f6d648 = luaG_toobig          (lua_State*) - does not return
-                                   Called when a string exceeds 0x40000000 bytes.
+0x03f6d648 = luaG_toobig          (no return - string > 0x40000000 bytes)
 ```
 
 ### Strings
-
 ```
-0x03f6fc34 = luaS_hash            (const char* s, size_t len) -> uint
-                                   Computes the string hash used for interning.
-
-0x03f6ff1c = luaS_newlstr         (lua_State*, const char* s, size_t len) -> TString*
-                                   Interns a string: looks it up in the global string
-                                   table, returns the existing TString if found,
-                                   otherwise allocates a new one and inserts it.
-                                   New strings get atom = -1 (unassigned).
-
-0x03f6fcc0 = luaS_resize          (lua_State*, int newsize)
-                                   Resizes the string interning hash table.
+0x03f6fc34 = luaS_hash            (const char*, size_t) -> uint
+0x03f6ff1c = luaS_newlstr         (lua_State*, const char*, size_t) -> TString*
+0x03f6fcc0 = luaS_resize
 ```
 
 ### Tables
-
 ```
 0x03f736b8 = luaH_new             (lua_State*, int narray, int nhash) -> Table*
-                                   Allocates a new empty Table (0x30 bytes).
-                                   Sets lsizenode=0 (1 dummy slot), flags=0xff,
-                                   node = dummy node sentinel, metatable = NULL.
-                                   Calls luaH_resizearray / luaH_resizehash if
-                                   narray or nhash are > 0.
-
-0x03f7376c = luaH_resizearray     (lua_State*, Table*, int narray)
-0x03f7387c = luaH_resizehash      (lua_State*, Table*, int nhash)
-
+0x03f7376c = luaH_resizearray
+0x03f7387c = luaH_resizehash
 0x03f73a8c = luaH_getstr          (Table*, TString*) -> TValue*
-                                   Raw hash lookup by string key. Returns a pointer
-                                   to the static nil sentinel on a miss -
-                                   do not write through that pointer.
+                                   Returns &DAT_04ebdbc0 (nil sentinel) on miss.
 ```
 
 ### Metamethods / Type System
-
 ```
-0x03f75e60 = luaT_init            Interns all metamethod names into g->tmname[] at startup.
-
-0x03f75f6c = luaT_gettmbyobj      (lua_State*, TValue* obj, uint event) -> TValue*
-                                   Metamethod lookup. Checks the object's own metatable
-                                   for TABLE and USERDATA; uses g->mt[tt] for everything else.
+0x03f75e60 = luaT_init
+0x03f75f6c = luaT_gettmbyobj      (lua_State*, TValue*, uint event) -> TValue*
 ```
 
 ### Error Reporting
-
 ```
-0x03f660f0 = luaG_runerror        (lua_State*, const char* fmt, ...) - does not return
-0x03f660c0 = luaG_typeerror       Calls luaO_tostring to get the type name, then hits
-                                   luaG_runerror with "attempt to %s a %s value".
+0x03f660f0 = luaG_runerror        (no return)
+0x03f660c0 = luaG_typeerror
 0x03f662b4 = luaG_indexerror
-0x03f81e98 = tryfuncTM            The __call metamethod handler inside luaD_precall.
-                                   When a value isn't a function, this runs first -
-                                   looks up __call (event 4) via luaT_gettmbyobj,
-                                   shuffles the stack to insert the metamethod if found,
-                                   and throws a type error if not.
+0x03f81e98 = tryfuncTM            (__call metamethod handler in luaD_precall)
 ```
 
 ### Misc
-
 ```
 0x03f7607c = luaO_tostring
-0x03f76a08 = luaopen_vector       The vector library initializer.
-                                   NOTE: early on this looked promising because it showed
-                                   up in __index xrefs. It's not a metamethod lookup -
-                                   it just registers an __index handler. Don't chase
-                                   xref counts blindly without checking what the function
-                                   actually does with the string.
+0x03f76a08 = luaopen_vector
 0x03f77254 = vector __index handler
 ```
 
-### C API (recovered from luaopen_vector)
-
+### C API
 ```
-0x03f5e5fc = luaL_register        (lua_State*, name, luaL_Reg[])
+0x03f5e5fc = luaL_register
 0x03f5bae4 = lua_pushvector       (float x, float y, float z, lua_State*)
-                                   L is the last argument here - the three floats
-                                   consume the first float registers on ARM64.
-0x03f5c724 = lua_setfield         (lua_State*, int idx, const char* name)
+                                   NOTE: L is last arg - floats consume ARM64
+                                   float registers first.
+0x03f5c724 = lua_setfield
 0x03f5c300 = lua_createtable / luaL_newlib
 0x03f5bcc4 = lua_pushcfunction / lua_pushcclosure
 0x03f5c38c = lua_rawseti or lua_setfield variant
@@ -515,39 +463,31 @@ Thread status values (`L+0x03`):
 ## Static Data
 
 ```
-DAT_04ebdbc0 = Static nil TValue sentinel. Returned by luaH_getstr and luaT_gettmbyobj
-               on a miss. Don't write to this address.
-
-DAT_04ebdcd0 = Dummy LuaNode sentinel. Used as Table->node for empty tables with no
-               hash part. Don't write to this address either.
-
-DAT_05dae828 = Vector library luaL_Reg[] function table.
-
-DAT_05dadd88 = lua_exception vtable.
-
-DAT_05fabec8 = Global feature flag byte. Checked at the top of lua_resume and in the
-               resume loop. When it's 0x01, coroutine-extended behavior is enabled.
-               Exactly what it gates is still being looked into.
+DAT_04ebdbc0 = nil TValue sentinel  (luaH_getstr / luaT_gettmbyobj miss - do not write)
+DAT_04ebdcd0 = dummy LuaNode        (Table->node for empty tables - do not write)
+DAT_05dae828 = vector lib luaL_Reg[]
+DAT_05dadd88 = lua_exception vtable
+DAT_05fabec8 = global feature flag byte (0x01 = coroutine-extended behavior enabled)
 ```
 
 ---
 
 ## What's Left
 
-The map is solid but there are still gaps worth filling.
-
 | Target | Why it matters |
 |---|---|
-| Outer `lua_newstate` (xref callers of 0x03f6fac4) | Closes `g+0x10`→`g+0x37`: mainthread, frealloc, ud, panic |
-| `luaV_execute` (0x03f7747c) | Full Proto layout + all opcode handlers - big function, worth it |
-| GC functions (`luaC_step` etc.) | Closes `g+0x48`→`g+0x31f` - the whole GC list block |
-| `TValue+0x08` semantic meaning | Still unresolved - try a table set function or luaV_execute |
-| `g+0x488`→`g+0x497` | 16 mystery bytes between `mt[]` and the registry |
-| `Closure+0x03` | Confirm numparams vs nupvalues |
-| `Proto+0x04` | Confirm is_vararg vs numparams |
-| `Table+0x03`, `Table+0x06`→`+0x17` | Fill remaining Table fields (sizearray, array*) |
-| `TString+0x06` | Confirm meaning of the 0x8000 sentinel |
+| `luaV_execute` (0x03f7747c) | Full Proto layout + opcode handlers |
+| GC functions (`luaC_step` etc.) | Closes `g+0x48`→`g+0x31f`; pins `g+0x58/0x68/0x70` |
+| `TValue+0x08` | Still unknown - try a table set path or luaV_execute |
+| `g+0x488`→`g+0x497` | 12 bytes between `mt[]` and registry |
+| `g+0x4a8` | 0x70000000 - memory cap? Roblox sandbox limit? |
+| `g+0x28`, `g+0x30`, `g+0x318` | Zeroed unknowns from lua_newstate |
+| `Closure+0x03` | numparams vs nupvalues |
+| `Proto+0x04` | is_vararg vs numparams |
+| `Table+0x06`→`+0x17` | sizearray, array* |
+| `TString+0x06` | 0x8000 sentinel meaning |
+| `L+0x78` | NULL on init, unknown purpose |
 
 ---
 
-*Offsets are specific to version 2.720.1164. Verify before putting these into anything. Corrections welcome.*
+*Offsets are specific to version 2.720.1164. Verify before use. Corrections welcome.*
