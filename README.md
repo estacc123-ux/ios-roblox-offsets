@@ -96,15 +96,17 @@ sizeof(lua_State) = 0x80
 ## TValue (0x10 bytes)
 
 ```cpp
-TValue + 0x00 = value union  (8 bytes - pointer, double, or int depending on tt) [HIGH]
-TValue + 0x08 = extra        (4 bytes - confirmed real field; purpose unknown)    [LOW]
-TValue + 0x0c = tt           (int - type tag, see Type Tags section)              [HIGH]
+TValue + 0x00 = value union  (8 bytes - pointer, double, or int depending on tt)   [HIGH]
+                               For LUA_TVECTOR: +0x00=X (float), +0x04=Y (float)
+TValue + 0x08 = vec_z        (float - vector Z component for LUA_TVECTOR;
+                               confirmed via lua_pushvector store sequence;
+                               unused/zero for all other types)                     [HIGH]
+TValue + 0x0c = tt           (int - type tag, see Type Tags section)                [HIGH]
 ```
 
-`TValue+0x08` is not padding - it appears as a structurally distinct field in `LuaNode`
-key layout (sits between `key.value` and the packed `key.tt+next` word). No analyzed
-function reads or writes it for plain stack TValues yet. Best guess: hash cache for
-strings, or spare field for future use.
+> **vec_z confirmed:** `lua_pushvector` (`FUN_03f5bae4`) stores X at `+0x00`, Y at `+0x04`,
+> Z at `+0x08`, then `tt = 5` (LUA_TVECTOR) at `+0x0c`. The field was previously listed as
+> `extra` with purpose unknown. It is the Z component, zero / ignored for non-vector TValues.
 
 ---
 
@@ -115,15 +117,21 @@ TString + 0x00 = tt      (byte - 0x06 = LUA_TSTRING)    [HIGH]
 TString + 0x01 = memcat  (byte)                          [HIGH]
 TString + 0x02 = marked  (byte - bit 3 = pinned/fixed)  [HIGH]
 TString + 0x03 = extra   (byte)                          [MED]
-TString + 0x04 = atom    (int16 - fast-comparison ID; -1 = not yet assigned)  [MED]
-TString + 0x06 = ???     (int16 - initialized to 0x8000, purpose unknown)     [LOW]
-TString + 0x08 = next    (TString* - next in interning hash chain)            [HIGH]
-TString + 0x10 = hash    (uint)                                               [HIGH]
-TString + 0x14 = len     (uint)                                               [HIGH]
-TString + 0x18 = data[]  (inline chars, null terminated)                      [HIGH]
+TString + 0x04 = atom    (int16 - fast-comparison ID; -1 / 0xFFFF = not yet assigned)  [HIGH]
+TString + 0x06 = atom2   (int16 - second intern index; 0x8000 = not yet assigned)      [MED]
+TString + 0x08 = next    (TString* - next in interning hash chain)                     [HIGH]
+TString + 0x10 = hash    (uint)                                                        [HIGH]
+TString + 0x14 = len     (uint)                                                        [HIGH]
+TString + 0x18 = data[]  (inline chars, null terminated)                               [HIGH]
 
 sizeof(TString) = 0x18 + len + 1
 ```
+
+> **TString+0x04 / +0x06:** `luaS_newlstr` writes both fields in a single 4-byte store:
+> `*(uint32*)(s + 4) = 0x8000FFFF` (little-endian: `0xFFFF` at +0x04, `0x8000` at +0x06).
+> `atom = -1` (0xFFFF as int16) is the standard "not yet assigned" sentinel. `atom2 = 0x8000`
+> (INT16_MIN) mirrors the same pattern - almost certainly a second intern index, possibly for
+> `__namecall` or another Roblox-specific string table.
 
 Permanently pinned strings (marked |= 8 in `luaE_newstate`):
 - `"not enough memory"`
@@ -156,24 +164,34 @@ ci + 0x24 = flags    (int)                                                    [M
 Closure + 0x00 = tt         (byte - 0x08 = LUA_TFUNCTION)                  [HIGH]
 Closure + 0x01 = memcat     (byte)                                          [HIGH]
 Closure + 0x02 = marked     (byte - GC flags)                               [HIGH]
-Closure + 0x03 = numparams  (byte)                          [MED - could be nupvalues]
+Closure + 0x03 = numparams  (byte - parameter slot count; cached from Proto
+                              for fast frame sizing in luaD_precall)        [HIGH]
 Closure + 0x04 = unknown    (byte)                                          [LOW]
 Closure + 0x05 = isC        (byte - 0 = Lua closure, nonzero = C closure)  [HIGH]
 Closure + 0x08 = next       (GCObject* - GC linkage, inferred from TString pattern) [MED]
-Closure + 0x10 = ???        (pointer - read in interpreter; byte at +7 of the
-                              pointed-to object gates fast-path execution.
-                              Possibly gclist or _ENV upvalue pointer)       [LOW]
+Closure + 0x10 = gclist     (GCObject* - GC gray list chain pointer;
+                              confirmed via luaC_barrier prepend pattern)   [HIGH]
 Closure + 0x18 = Proto*     (Lua closures) / lua_CFunction (C closures)    [HIGH]
 Closure + 0x28 = cont*      (C closures only - continuation fn ptr;
                               NULL = not yieldable across this call)        [HIGH]
 ```
+
+> **Closure+0x03 correction:** Earlier notes listed this as possibly `nupvalues`. It is
+> `numparams`. `luaD_precall` reads it directly as the parameter slot count for frame
+> sizing: `ci->top = base + numparams * sizeof(TValue)`. The binary caches numparams in
+> the Closure instead of reading it from Proto at every call.
+>
+> **Closure+0x10:** Confirmed `gclist` via `luaC_barrier` - the barrier prepends GC objects
+> to the gray list by writing `obj->gclist = g->gray` then `g->gray = obj`, with the gclist
+> pointer at `obj+0x10` for all heap-allocated GC objects.
 
 ---
 
 ## Proto (partial)
 
 ```cpp
-Proto + 0x04 = byte  - is_vararg   (if 0: L->top = ci->top on call)   [MED]
+Proto + 0x04 = byte  - is_vararg    (if 0: L->top = ci->top on call,
+                        capping the stack at numparams slots)            [HIGH]
 Proto + 0x05 = byte  - maxstacksize (nil-fill loop bound in precall,
                         confirmed in multiple opcode handlers)           [HIGH]
 Proto + 0x08 = ptr   - upvalue-related (0 = skip upvalue init)         [LOW]
@@ -187,7 +205,11 @@ Proto + 0x40 = code  (Instruction* - bytecode array, stored into
 // likely contains: sizek, sizecode, sizelineinfo, nups, p (nested protos ptr), etc.
 ```
 
-> **Conflict resolved:** An earlier session labeled Proto+0x05 as `numparams`. It is
+> **Proto+0x04 confirmed:** `luaD_precall` branches on `pcVar9[4] == 0` (byte at Proto+0x04).
+> When zero (non-vararg), it executes `L->top = ci->top`, capping the stack to exactly
+> `numparams` slots. This is precisely the `is_vararg` branch documented in the Luau source.
+>
+> **Proto+0x05 conflict resolved:** An earlier session labeled Proto+0x05 as `numparams`. It is
 > `maxstacksize`. Confirmed by two separate paths: the nil-fill loop in `luaD_precall`
 > (which uses it as a slot count) and direct reads in multiple opcode handlers immediately
 > after loading Proto*.
@@ -196,26 +218,24 @@ Proto + 0x40 = code  (Instruction* - bytecode array, stored into
 
 ## Table (0x30 bytes)
 
-> ⚠️ The positions of `array*` and `sizearray` below differ from some earlier notes and
-> Positions here are derived from direct opcode handler
-> analysis - a table set handler reads `Table+0x08` as a `uint` to bounds-check an array
-> index, and reads `Table+0x18` as a pointer to compute `array[C]`. That evidence overrides
-> the earlier luaH_new-based guesses.
-
 ```cpp
 Table + 0x00 = tt         (byte - 0x07 = LUA_TTABLE)                      [HIGH]
 Table + 0x01 = memcat     (byte)                                           [HIGH]
 Table + 0x02 = marked     (byte - GC color = g->gccolor & 3 on creation)  [HIGH]
-Table + 0x03 = ???        (byte - zeroed on init)                          [LOW]
+Table + 0x03 = nodemask   (byte - (1<<lsizenode)-1; precomputed hash bucket
+                            mask; 0 before first hash use, written on every
+                            resize: ~(-1 << lsizenode))                    [HIGH]
 Table + 0x04 = lsizenode  (byte - log2 hash node count; 0 = 1 dummy slot) [HIGH]
 Table + 0x05 = flags      (byte - 0xff on init; bit p=1 means metamethod
                             p is absent, skipping lookup overhead)         [HIGH]
-Table + 0x06 = ???        (byte - checked == 0 in table-set fast path;
-                            purpose unknown)                               [LOW]
+Table + 0x06 = ???        (byte - zeroed on init; checked == 0 in
+                            table-set fast path)                           [LOW]
 Table + 0x07 = ???        (byte - zeroed)                                  [LOW]
 Table + 0x08 = sizearray  (uint - array part capacity)                    [HIGH]
-Table + 0x0c = ???        (4 bytes - zeroed)                               [LOW]
-Table + 0x10 = ???        (8 bytes - likely lastfree or gclist ptr)        [LOW]
+Table + 0x0c = lastfree   (uint - free node index, integer not pointer;
+                            init = 1<<lsizenode, decremented during
+                            collision resolution to find free slots)       [HIGH]
+Table + 0x10 = gclist     (GCObject* - GC gray list chain pointer)        [HIGH]
 Table + 0x18 = array*     (TValue* - array part base; NULL on empty table) [HIGH]
 Table + 0x20 = node       (LuaNode* - hash part; &DAT_04ebdcd0 dummy
                             on empty table)                                [HIGH]
@@ -223,6 +243,20 @@ Table + 0x28 = metatable  (Table* - NULL if none)                          [HIGH
 
 sizeof(Table) = 0x30
 ```
+
+> **Table+0x03 (nodemask):** Previously `[LOW]` unknown, zeroed on init. Confirmed via
+> `luaH_resizehash`: written as `~(-1 << lsizenode)` = `(1<<lsizenode)-1` on every resize.
+> Used as `hash & nodemask` to compute bucket index directly without division.
+>
+> **Table+0x0c (lastfree):** Previously `[LOW]` unknown. Roblox stores this as an **integer
+> index** (not a pointer as in standard Lua). Initialized to the full node count
+> (`1 << lsizenode`) and decremented to find free slots during collision resolution.
+> This is why it fits in a `uint` (4 bytes) rather than a full 8-byte pointer.
+>
+> **Table+0x10 (gclist):** Resolved by elimination once `lastfree` was confirmed at +0x0c.
+> Consistent with all other GC objects (`gclist` at the same relative position after the
+> GC header). The `array*` pointer at +0x18 confirmed separately by `luaH_resizearray`'s
+> realloc call sequence.
 
 ---
 
@@ -232,16 +266,16 @@ Each slot in the Table hash part. Key type tag and next-chain offset are packed 
 
 ```cpp
 node + 0x00 = val.value  (8 bytes - value union)              [HIGH]
-node + 0x08 = val.extra  (4 bytes - TValue+0x08 field)        [LOW]
+node + 0x08 = val.vec_z  (float - vector Z if val is LUA_TVECTOR, else 0) [HIGH]
 node + 0x0c = val.tt     (int - value type tag)               [HIGH]
 node + 0x10 = key.value  (8 bytes - key union; TString* for string keys) [HIGH]
-node + 0x18 = key.extra  (4 bytes - TValue+0x08 field)        [LOW]
+node + 0x18 = key.vec_z  (float - vector Z if key is LUA_TVECTOR, else 0) [HIGH]
 node + 0x1c = packed uint32:                                   [HIGH]
                 bits  [3:0]  = key.tt  (type tag)
                 bits [31:4]  = next offset (signed, in LuaNode units of 0x20 bytes)
 ```
 
-Hash lookup: `bucket = TString->hash & ((1 << lsizenode) - 1)`.  
+Hash lookup: `bucket = TString->hash & nodemask` (Table+0x03).  
 Chain end: `node+0x1c < 0x10` - means next==0 and key==nil (empty or end of chain).
 
 ---
@@ -267,7 +301,9 @@ g + 0x10  = frealloc    (lua_Alloc - allocator function pointer)         [HIGH]
 g + 0x18  = ud          (void* - allocator userdata)                     [HIGH]
 g + 0x20  = panic       (lua_CFunction - unprotected error handler;
                           NULL on init)                                   [HIGH]
-g + 0x28  = ???         (8 bytes - zeroed by lua_newstate)               [LOW]
+g + 0x28  = gray        (GCObject* - active gray list head; zeroed at
+                          init, populated during GC operation; confirmed
+                          via luaC_barrier prepend pattern)               [HIGH]
 g + 0x30  = ???         (8 bytes - zeroed by lua_newstate)               [LOW]
 
 g + 0x38  = strt.size   (uint - bucket count; 0x20 after luaS_resize)   [HIGH]
@@ -280,15 +316,31 @@ g + 0x4c  = gcstepmul   (uint32 - 200 on init)                           [HIGH]
 g + 0x50  = ???         (uint32 - 0x400 on init; possibly gcstepsize)    [MED]
 g + 0x54  = gccolor     (byte - 9 on init; bits[1:0]=mark color,
                           bit[3]=GC phase flag)                           [MED]
-g + 0x55  = ???         (byte - zeroed)                                   [LOW]
+g + 0x55  = gcstate     (byte - GC phase; value 2 = sweep phase, triggers
+                          different barrier behavior in luaC_barrier)     [HIGH]
 
-// GC lists (partially mapped from lua_newstate init stores):
-g + 0x58  = ???         (GC list anchor - g+0x68 and g+0x70 point here)  [MED]
-g + 0x60  = ???         (8 bytes - unknown)                               [LOW]
-g + 0x68  = gray        (GCObject* - initialized to &g+0x58)             [MED]
-g + 0x70  = grayagain   (GCObject* - initialized to &g+0x58)             [MED]
+// GC lists (partially mapped):
+g + 0x58  = gc_sentinel (16-byte dummy anchor; both g+0x68 and g+0x70 are
+                          initialized to point here - it serves as the
+                          list-end sentinel for GC traversal lists)       [MED]
+g + 0x60  = ???         (8 bytes - part of sentinel object above)        [LOW]
+g + 0x68  = ???         (GCObject* - GC traversal list head #1;
+                          init → &g+0x58 sentinel; NOT the active gray
+                          list - that is g+0x28; likely grayagain or weak,
+                          confirmed by lua_newstate store sequence but
+                          distinction requires luaC_step)                 [MED]
+g + 0x70  = ???         (GCObject* - GC traversal list head #2;
+                          init → &g+0x58 sentinel; same caveat as g+0x68) [MED]
 
-// g+0x78 through g+0x30f: GC list block (rootgc, weak, etc.) - needs luaC_step
+// g+0x78 through g+0x30f: GC list block (rootgc, weak, allweak, etc.) - needs luaC_step
+
+// Extended Roblox-specific region (all zeroed on init except g+0x510):
+g + 0x500 = ???         (8 bytes - zeroed)                               [LOW]
+g + 0x508 = ???         (8 bytes - zeroed)                               [LOW]
+g + 0x510 = ???         (size_t or uint - set to 1 by lua_newstate;
+                          unique non-zero init in this region; purpose
+                          unknown - possibly a version flag or ref count) [LOW]
+g + 0x518 = ???         (zeroed; further fields continue to ~g+0x768)   [LOW]
 
 g + 0x310 = mainthread  (lua_State*)                                      [HIGH]
 g + 0x318 = ???         (8 bytes - between mainthread and tmname[0])      [LOW]
@@ -352,8 +404,9 @@ g + 0x490 = ???     (8 bytes - zeroed)   [LOW]
 g + 0x498 = registry.value  (Table*)       [HIGH]
 g + 0x4a4 = registry.tt     (int - 7 = LUA_TTABLE)  [HIGH]
 
-g + 0x4a8 = ???     (uint32 - 0x70000000 on init; likely a Roblox-specific
-                     memory cap or sandbox memory limit)                   [LOW]
+g + 0x4a8 = ???     (uint32 - 0x70000000 on init; confirmed via lua_newstate
+                     store at puVar3+0x294 * 2 = g+0x4a8; likely a Roblox-specific
+                     memory cap or sandbox memory limit)                   [MED]
 
 // Roblox sandbox / callback hooks:
 g + 0x4b8 = global_set_hook  (fn ptr - Roblox sandbox interceptor)       [MED]
@@ -362,7 +415,46 @@ g + 0x548 = cb.interrupt     (fn ptr - called at luaV_execute entry when
                                ci->flags bit 2 is set; receives (L, Proto*)) [HIGH]
 g + 0x550 = cb.panic         (fn ptr)                                     [MED]
 g + 0x558 = cb.userthread    (fn ptr)                                     [MED]
+
+// Per-memory-category size tracking (confirmed from lua_newstate bzero pattern):
+g + 0x2c00 = memsize[256]  (size_t[256] - per-memcat byte totals; init:
+                             memsize[0] = 0x4710 (the combined LG block),
+                             all other entries = 0;
+                             lua_newstate: bzero(g+0x2c08, 0x7f8) then
+                             *(size_t*)(g+0x2c00) = 0x4710)              [MED]
+
+// Roblox-specific large data blocks (extents from lua_newstate _bzero calls):
+g + 0x3400 = ???  (0x800 bytes zeroed - purpose unknown)                 [LOW]
+g + 0x3c00 = ???  (0x400 bytes zeroed - purpose unknown)                 [LOW]
+g + 0x4000 = ???  (0x410 bytes zeroed if DAT_05fabf10 flag is set)       [LOW]
+
+// sizeof(global_State) ≈ 0x4690 (allocation is 0x4710; lua_State is 0x80)
 ```
+
+> **g+0x28 correction:** Previously listed as unknown `[LOW]`. Confirmed `gray` (active gray
+> list head) via `luaC_barrier`: the barrier writes `obj->gclist = g->gray` then
+> `g->gray = obj`, with `g->gray` at `g+0x28`. Earlier `[MED]` guess of `uvhead` was wrong.
+>
+> **g+0x55 correction:** Previously `[LOW]`. Confirmed `gcstate` (GC phase byte) via
+> `luaC_barrier`: `if (*(char*)(g + 0x55) == 2)` branches to the sweep-phase barrier path.
+>
+> **g+0x58 / g+0x68 / g+0x70:** Full `lua_newstate` decompile confirms both g+0x68 and g+0x70
+> are initialized to `puVar3+0x6c` = `&g+0x58`. This means g+0x58 is a sentinel object (not
+> a real GCObject) used as the list-end marker. Since `gray = g+0x28` (confirmed), g+0x68 and
+> g+0x70 must be other traversal lists. The previous label `grayagain` on g+0x68 was an
+> unconfirmed guess and has been removed. Pull `luaC_step` to distinguish them.
+>
+> **g+0x510 = 1:** Set explicitly by `lua_newstate` as the only non-zero value in the g+0x500
+> block. Unique among this region; exact purpose unknown.
+>
+> **g+0x2c00 (memsize[]):** `lua_newstate` uses `_bzero(puVar3+0x1644, 0x7f8)` then
+> `*(size_t*)(puVar3+0x1640) = 0x4710` to initialize 256 × 8-byte per-memcat size entries.
+> Entry 0 = 0x4710 (the initial combined allocation), all others = 0.
+>
+> **g+0x4a8:** Confirmed present in `lua_newstate` via offset arithmetic
+> (`puVar3+0x294`, with `undefined2*` pointer arithmetic: `0x294 * 2 = 0x528` from base,
+> `g = base+0x80`, so `g+0x4a8`). Purpose still unknown - likely a memory cap or sandbox
+> limit given the round value `0x70000000`.
 
 ---
 
@@ -627,18 +719,17 @@ DAT_05fabf10 = feature flag           checked in lua_newstate
 
 | Target | What it unlocks | Priority |
 |---|---|---|
-| GC functions (`luaC_step` etc.) | Closes `g+0x78`→`g+0x30f`; pins gray/rootgc/weak lists | High |
-| `luaH_resizearray` (0x03f7376c) | Pins `Table+0x10` (lastfree vs gclist) | High |
+| GC functions (`luaC_step` etc.) | Distinguishes g+0x68 vs g+0x70 (grayagain/weak/allweak); closes g+0x78→g+0x30f GC list block | High |
 | `Proto+0x20`→`+0x37` gap | sizek, sizecode, nups, nested proto array | High |
-| `Proto+0x04` | Confirm is_vararg vs numparams | Med |
-| `Closure+0x03` | Confirm numparams vs nupvalues | Med |
-| `Closure+0x10` | Unknown pointer - gclist or \_ENV upvalue? | Med |
-| `TValue+0x08` | Still purpose-unknown - try table set slow path | Med |
-| `g+0x28`, `g+0x30`, `g+0x318` | Zeroed unknowns from lua_newstate | Low |
+| `g+0x30`, `g+0x318` | Zeroed unknowns; need `lua_resume` full body or upvalue fns | Med |
+| `L+0x78` | NULL on init; need CLOSE opcode handler or `luaF_close` | Med |
+| `g+0x510` | = 1 on init; purpose unknown - could be a version flag or memcat ref count | Med |
+| `g+0x500`→`g+0x768` gap | Extended Roblox-specific region; callback struct boundaries unclear | Med |
+| `g+0x3400`, `g+0x3c00`, `g+0x4000` | Large _bzero'd blocks; likely Roblox sandbox data | Low |
+| `Closure+0x04` | Unknown byte between numparams and isC | Low |
+| `Table+0x06`, `+0x07` | Zeroed on init; likely padding | Low |
 | `g+0x488`→`g+0x497` | 12 bytes between `mt[]` end and registry | Low |
-| `g+0x4a8` | 0x70000000 - memory cap? Roblox sandbox limit? | Low |
-| `TString+0x06` | 0x8000 sentinel - meaning unknown | Low |
-| `L+0x78` | NULL on init, purpose unknown | Low |
+| `g+0x4a8` | 0x70000000 confirmed present; purpose (memory cap?) still unknown | Low |
 
 ---
 
