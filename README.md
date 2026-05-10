@@ -9,7 +9,7 @@
 > repo and wondering why everything is on fire. Android offsets coming later, been busy.
 
 
-also check out: https://github.com/60ve/roblox-ios-offsets
+also check out he funny: https://github.com/60ve/roblox-ios-offsets
 
 ---
 
