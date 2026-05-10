@@ -194,7 +194,7 @@ Proto + 0x40 = code  (Instruction* - bytecode array, stored into
 ## Table (0x30 bytes)
 
 > ⚠️ The positions of `array*` and `sizearray` below differ from some earlier notes and
-> from the other AI session's output. Positions here are derived from direct opcode handler
+> Positions here are derived from direct opcode handler
 > analysis - a table set handler reads `Table+0x08` as a `uint` to bounds-check an array
 > index, and reads `Table+0x18` as a pointer to compute `array[C]`. That evidence overrides
 > the earlier luaH_new-based guesses.
