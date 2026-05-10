@@ -12,6 +12,9 @@
 
 also check out he funny: https://github.com/60ve/roblox-ios-offsets
 
+
+### **NOTE: iOS AC is disabled, and only luau and other dtcs that no one knows of are enabled**
+
 ---
 
 ## How This Was Done
