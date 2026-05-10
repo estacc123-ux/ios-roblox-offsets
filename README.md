@@ -2,7 +2,8 @@
 > **Binary:** Roblox iOS (ARM64)  
 > **Tool:** Ghidra + Jython scripting console  
 > **Download:** https://decrypt.day/app/id431946152  
->
+> Also Forgot Credit me estacc123-ux and 60ve(aka love)
+> 
 > This took a while. What follows is a map of the Luau VM internals from the Roblox
 > iOS binary - structs, offsets, functions, the works. This is **Luau** (Roblox's fork
 > of Lua 5.1), not standard Lua, so don't go copying offsets from some random Lua 5.3
