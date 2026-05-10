@@ -8,6 +8,9 @@
 > of Lua 5.1), not standard Lua, so don't go copying offsets from some random Lua 5.3
 > repo and wondering why everything is on fire. Android offsets coming later, been busy.
 
+
+also check out: https://github.com/60ve/roblox-ios-offsets
+
 ---
 
 ## How This Was Done
