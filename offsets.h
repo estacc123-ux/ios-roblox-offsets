@@ -5,6 +5,7 @@
 // Roblox iOS (ARM64) - Luau VM offsets
 // Version: 2.720.1164
 // Confidence: HIGH = verified directly, MED = inferred/consistent, LOW = best guess
+// Cars = Verified direct cat from both IDA, Ghidra and Eggos Waffles
 
 namespace offsets
 {
