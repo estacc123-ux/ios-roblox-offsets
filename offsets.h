@@ -129,7 +129,7 @@ namespace L
     constexpr std::uintptr_t marked        = 0x02; // [HIGH] byte   GC flags; bit0=color bit3=pinned; value 9 on main thread
     constexpr std::uintptr_t status        = 0x03; // [HIGH] byte   thread status (see status:: namespace below)
     constexpr std::uintptr_t active_memcat = 0x04; // [HIGH] byte   memcat used for objects this thread allocates; distinct from L::memcat which is the thread object's own category
-    constexpr std::uintptr_t native_exec   = 0x06; // [MED]  byte   0x01 = NCG native code path active; checked by luaV_execute_dispatch
+    constexpr std::uintptr_t native_exec   = 0x06; // [HIGH] byte   0x01 = NCG native code path active; checked by luaV_execute_dispatch
     constexpr std::uintptr_t stacksize     = 0x08; // [HIGH] int    value stack slot count
     constexpr std::uintptr_t size_ci       = 0x0c; // [HIGH] int    CallInfo array slot count; 8 on init
     constexpr std::uintptr_t l_G           = 0x18; // [HIGH] global_State* shared across all coroutines in the same VM
@@ -259,12 +259,13 @@ namespace CL
 // Gap at +0x20 through +0x37 is still dark. Probably sizek, sizecode, nups, nested protos.
 namespace PT
 {
-    constexpr std::uintptr_t is_vararg    = 0x04; // [HIGH] byte        0 = fixed-arg; nonzero = vararg
-                                                  //        luaD_precall branches here: if 0, sets L->top = ci->top to cap the stack at numparams slots
-    constexpr std::uintptr_t maxstacksize = 0x05; // [HIGH] byte        max register slots needed; used as nil-fill loop bound in luaD_precall
-                                                  //        earlier sessions mislabeled this as numparams; it is maxstacksize
-    constexpr std::uintptr_t k           = 0x38;  // [HIGH] TValue*     constants array; cached into a register at luaV_execute entry (0x03f7b078: ldr x8,[x8,#0x38])
-    constexpr std::uintptr_t code        = 0x40;  // [HIGH] Instruction* bytecode array; stored into ci->savedpc at call time
+    constexpr std::uintptr_t numparams     = 0x03; // [HIGH] byte      number of fixed parameters (read from the .luac header)
+    constexpr std::uintptr_t is_vararg     = 0x04; // [HIGH] byte      0 = fixed-arg; nonzero = vararg
+                                                   //        luaD_precall branches here: if 0, sets L->top = ci->top to cap the stack at numparams slots
+    constexpr std::uintptr_t maxstacksize  = 0x05; // [HIGH] byte      max register slots needed; used as nil-fill loop bound in luaD_precall
+                                                   //        earlier sessions mislabeled this as numparams; it is maxstacksize
+    constexpr std::uintptr_t k            = 0x38;  // [HIGH] TValue*   constants array; cached into a register at luaV_execute entry (0x03f7b078: ldr x8,[x8,#0x38])
+    constexpr std::uintptr_t code         = 0x40;  // [HIGH] Instruction* bytecode array; stored into ci->savedpc at call time
 } // namespace PT
 
 
@@ -314,8 +315,11 @@ namespace G
     constexpr std::uintptr_t cb_interrupt  = 0x548;  // [HIGH] fn ptr       lua_Callbacks::interrupt; receives (L, Proto*) when ci->flags bit2 is set
     constexpr std::uintptr_t cb_panic      = 0x550;  // [MED]  fn ptr       lua_Callbacks::panic
     constexpr std::uintptr_t cb_userthread = 0x558;  // [MED]  fn ptr       lua_Callbacks::userthread
-    constexpr std::uintptr_t memsize       = 0x2c00; // [MED]  size_t[256]  per-memcat byte totals
+    // Per-memory-category size tracking (confirmed from lua_newstate bzero pattern)
+    // g + 0x15c0 = base + 0x1640 (since g = base + 0x80)
+    constexpr std::uintptr_t memsize       = 0x15c0; // [HIGH] size_t[256]  per-memcat byte totals
                                                      //        entry 0 = 0x4710 on init (the combined LG block); all others = 0
+                                                     //        lua_newstate: bzero(puVar3+0x1644, 0x7f8) then *(size_t*)(puVar3+0x1640) = 0x4710
 } // namespace G
 
 
