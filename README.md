@@ -1,11 +1,11 @@
 > **Version:** 2.720.116
 > 4
 > **Binary:** Roblox iOS (ARM64)
-> 
+>
 > **Tool:** Ghidra + Jython scripting console
-> 
+>
 > **Download:** https://decrypt.day/app/id431946152
-> 
+>
 > Also Forgot Credit me estacc123-ux and 60ve(aka love)
 >
 > This took a while. What follows is a map of the Luau VM internals from the Roblox
@@ -440,7 +440,7 @@ g + 0x4a4 = registry.tt     (int - 7 = LUA_TTABLE)  [HIGH]
 
 g + 0x4a8 = ???     (uint32 - 0x70000000 on init; confirmed via lua_newstate
                      store at puVar3+0x294 * 2 = g+0x4a8; likely a Roblox-specific
-                     memory cap or sandbox memory limit)                   [MED]
+                     memory cap or sandbox memory limit)                   [HIGH]
 
 // Roblox sandbox / callback hooks:
 g + 0x4b8 = global_set_hook  (fn ptr - Roblox sandbox interceptor)       [MED]
@@ -466,11 +466,11 @@ g + 0x510 = ???         (size_t or uint - set to 1 by lua_newstate;
 g + 0x518 = ???         (zeroed; further fields continue to ~g+0x768)   [LOW]
 
 // Per-memory-category size tracking (confirmed from lua_newstate bzero pattern):
-g + 0x2c00 = memsize[256]  (size_t[256] - per-memcat byte totals; init:
+g + 0x15c0 = memsize[256]  (size_t[256] - per-memcat byte totals; init:
                              memsize[0] = 0x4710 (the combined LG block),
                              all other entries = 0;
-                             lua_newstate: bzero(g+0x2c08, 0x7f8) then
-                             *(size_t*)(g+0x2c00) = 0x4710)              [MED]
+                             lua_newstate: bzero(puVar3+0x1644, 0x7f8) then
+                             *(size_t*)(puVar3+0x1640) = 0x4710)              [HIGH]
 
 // Roblox-specific large data blocks (extents from lua_newstate _bzero calls):
 g + 0x3400 = ???  (0x800 bytes zeroed - purpose unknown)                 [LOW]
@@ -496,7 +496,7 @@ g + 0x4000 = ???  (0x410 bytes zeroed if DAT_05fabf10 flag is set)       [LOW]
 > **g+0x510 = 1:** Set explicitly by `lua_newstate` as the only non-zero value in the g+0x500
 > block. Unique among this region; exact purpose unknown.
 >
-> **g+0x2c00 (memsize[]):** `lua_newstate` uses `_bzero(puVar3+0x1644, 0x7f8)` then
+> **g+0x15c0 (memsize[]):** `lua_newstate` uses `_bzero(puVar3+0x1644, 0x7f8)` then
 > `*(size_t*)(puVar3+0x1640) = 0x4710` to initialize 256 × 8-byte per-memcat size entries.
 > Entry 0 = 0x4710 (the initial combined allocation), all others = 0.
 >
