@@ -201,8 +201,14 @@ Closure + 0x03 = stacksize  (byte - max stack slots needed by this closure;
                               NOT numparams - that is a separate field in Proto) [HIGH]
 Closure + 0x04 = nupvalues  (byte - upvalue count; likely)                  [MED]
 Closure + 0x05 = isC        (byte - 0 = Lua closure, nonzero = C closure)  [HIGH]
-Closure + 0x08 = ???        (unknown – likely padding or moved field)   [LOW]
-Closure + 0x10 = gclist     (GCObject* - GC gray list chain pointer; confirmed) [HIGH]
+Closure + 0x08 = ???        (unknown - likely padding or a moved field;
+                              open-source Luau has gclist here but decompiled
+                              luaC_barrier writes to param_2+0x10, not +0x08,
+                              proving Roblox shifted the layout)            [LOW]
+Closure + 0x10 = gclist     (GCObject* - GC gray list chain pointer;
+                              confirmed by luaC_barrier in this binary:
+                              *(obj+0x10) = g->gray then g->gray = obj;
+                              Roblox moved this from open-source +0x08)    [HIGH]
 Closure + 0x18 = Proto*     (Lua closures) / lua_CFunction (C closures)    [HIGH]
 Closure + 0x28 = cont*      (C closures only - continuation fn ptr;
                               NULL = not yieldable across this call)        [HIGH]
@@ -213,16 +219,14 @@ Closure + 0x28 = cont*      (C closures only - continuation fn ptr;
 > This matches open-source Luau's Closure struct where `stacksize` is the cached max-stack
 > field. `numparams` lives in Proto and is used for argument copying, not frame sizing.
 >
-> **Closure+0x08 correction:** Previously listed as `next (GCObject*)` inferred from TString
-> pattern. That is wrong. Luau's `CommonHeader` is `{tt, marked, memcat}` - there is no
-> `next` pointer in it. Luau uses page-based GC allocation; objects do not form per-object
-> linked lists. The field at +0x08 is `gclist` (the GC gray list chain), consistent with
-> all other GC objects in this binary. `TString+0x08` is a hash-chain `next` pointer
-> specific to the string intern table and should not be generalized.
+> **Closure+0x08:** Unknown. Open-source Luau has `gclist` at Closure+0x08, but the
+> decompiled `luaC_barrier` (`FUN_03f6938c`) in this binary writes `*(obj+0x10) = g->gray`
+> then `g->gray = obj` - the gray list prepend is unambiguously at +0x10, not +0x08.
+> Roblox shifted the layout; +0x08 is likely padding or a moved field.
 >
-> **Closure+0x10:** Confirmed `gclist` via `luaC_barrier` - the barrier prepends GC objects
-> to the gray list by writing `obj->gclist = g->gray` then `g->gray = obj`, with the gclist
-> pointer at `obj+0x10` for all heap-allocated GC objects.
+> **Closure+0x10 = gclist:** Confirmed directly from decompiled `luaC_barrier` in this
+> binary. The write `*(param_2+0x10) = *(g+0x28)` followed by `*(g+0x28) = param_2` is
+> the standard gray list prepend pattern, placing `gclist` at +0x10 for all GC objects.
 
 ---
 
@@ -243,7 +247,10 @@ Proto + 0x01 = memcat   (byte)                                              [MED
 Proto + 0x02 = marked   (byte - GC flags)                                   [MED]
 
 // Bytecode header bytes (written in order from the .luac stream):
-Proto + 0x03 = byte  - numparams (3rd header byte)                          [HIGH]
+Proto + 0x03 = byte  - numparams OR nups (3rd header byte; open-source Luau
+                        Proto has nups at +3 and numparams at +4, but Roblox
+                        may have swapped them - cannot confirm without full
+                        bytecode loader decompile; either is plausible)     [MED]
 Proto + 0x04 = byte  - is_vararg (4th header byte;
                         if 0: L->top = ci->top on call, capping the stack
                         at numparams slots - confirmed in luaD_precall)     [HIGH]
