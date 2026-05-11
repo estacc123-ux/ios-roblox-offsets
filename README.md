@@ -6,7 +6,7 @@
 >
 > **Download:** https://decrypt.day/app/id431946152
 >
-> Also Forgot Credit me estacc123-ux and 60ve(aka love)
+> Credits: me(estacc123-ux), 60ve(aka love), yellowgreg
 >
 > This took a while. What follows is a map of the Luau VM internals from the Roblox
 > iOS binary - structs, offsets, functions, the works. This is **Luau** (Roblox's fork
