@@ -1,9 +1,13 @@
-> **Version:** 2.720.1164  
-> **Binary:** Roblox iOS (ARM64)  
-> **Tool:** Ghidra + Jython scripting console  
-> **Download:** https://decrypt.day/app/id431946152  
-> Also Forgot Credit me estacc123-ux and 60ve(aka love)
+> **Version:** 2.720.116
+> 4
+> **Binary:** Roblox iOS (ARM64)
 > 
+> **Tool:** Ghidra + Jython scripting console
+> 
+> **Download:** https://decrypt.day/app/id431946152
+> 
+> Also Forgot Credit me estacc123-ux and 60ve(aka love)
+>
 > This took a while. What follows is a map of the Luau VM internals from the Roblox
 > iOS binary - structs, offsets, functions, the works. This is **Luau** (Roblox's fork
 > of Lua 5.1), not standard Lua, so don't go copying offsets from some random Lua 5.3
@@ -13,30 +17,31 @@
 also check out he funny: https://github.com/60ve/roblox-ios-offsets
 
 
-### **NOTE: iOS AC is disabled, and only luau and other detectionsthat no one knows of are enabled**
-
-## i got proto wrong 😭 will fix later i need sleep
+### **NOTE: iOS AC is disabled, and only luau and other detections that no one knows of are enabled**
 
 ---
 
 ## How This Was Done
 
-**1. String cross-references**  
+**1. String cross-references**
 Ghidra lets you find every piece of code that touches a string literal. Strings like `"attempt to call"`, `"__index"`, `"not enough memory"`, and `"13lua_exception"` are anchor points. Find the string, find the function that uses it, read what it does to nearby memory, and you've got struct offsets basically for free.
 
-**2. Known-value anchors in global_State**  
+**2. Known-value anchors in global_State**
 The `tmname[]` and `ttname[]` arrays are a gift. They hold interned strings for every metamethod (`"__index"`, `"__call"`, etc.) and type name (`"nil"`, `"string"`, etc.) in a fixed order defined by the Luau source. Find any one entry and you've pinned the entire array - and by extension, the base address of `global_State`.
 
-**3. lua_newstate / luaE_newstate as free layout maps**  
+**3. lua_newstate / luaE_newstate as free layout maps**
 The state initializers write to basically every important field at startup. `lua_newstate` gives you the allocator, userdata, panic handler, mainthread pointer, GC parameters, and the combined allocation size. `luaE_newstate` fills in `_G`, the registry, metamethod strings, and the pinned error strings. Just read the store sequences.
 
-**4. Store-sequence analysis**  
+**4. Store-sequence analysis**
 When a known function allocates a struct and immediately fills it in (like `luaD_precall` pushing a new `CallInfo`), the stores happen in field order. Reading them gives you the layout directly. This is also how we caught that a lot of public references have `CallInfo` wrong - `func` is not at `ci+0x00` in this binary.
 
-**5. Jython scripting for bulk extraction**  
+**5. Bytecode loader as a layout oracle**
+`luaU_undump` (`FUN_03f7ef1c`) writes to every single Proto field during deserialization. Decompiling it gives you the complete Proto layout in one shot - no scanning required.
+
+**6. Jython scripting for bulk extraction**
 For things like the opcode dispatch table (256 entries) or scanning all interpreter instructions for a specific access pattern, Ghidra's Jython console is faster than clicking. Scripts in this doc can be re-run against updated binaries to spot changes quickly.
 
-**6. C++ exception type_info**  
+**7. C++ exception type_info**
 Roblox's iOS build throws C++ exceptions for Lua errors instead of using `longjmp`. The `__cxa_throw` call passes a `std::type_info*`, which contains an Itanium-mangled class name string. Follow the pointer, read the string, and you get the class name and layout handed to you.
 
 **Confidence levels:**
@@ -193,32 +198,63 @@ Closure + 0x28 = cont*      (C closures only - continuation fn ptr;
 
 ---
 
-## Proto (partial)
+## Proto
+
+> Layout fully closed by `luaU_undump` (`FUN_03f7ef1c`) - the bytecode loader writes every
+> field during deserialization. Fields +0x08 and +0x10 are NOT written by the loader; they
+> are GC linkage set by the allocator (`luaF_newproto`, `FUN_03f67e24`), consistent with
+> the pattern on all other GC objects.
 
 ```cpp
-Proto + 0x04 = byte  - is_vararg    (if 0: L->top = ci->top on call,
-                        capping the stack at numparams slots)            [HIGH]
+// GC header (set by luaF_newproto, not written by luaU_undump):
+Proto + 0x00 = tt       (byte - LUA_TPROTO)                                 [MED]
+Proto + 0x01 = memcat   (byte)                                              [MED]
+Proto + 0x02 = marked   (byte - GC flags)                                   [MED]
+
+// Bytecode header bytes (written in order from the .luac stream):
+Proto + 0x03 = byte  - numparams (3rd header byte)                          [HIGH]
+Proto + 0x04 = byte  - is_vararg (4th header byte;
+                        if 0: L->top = ci->top on call, capping the stack
+                        at numparams slots - confirmed in luaD_precall)     [HIGH]
 Proto + 0x05 = byte  - maxstacksize (nil-fill loop bound in precall,
-                        confirmed in multiple opcode handlers)           [HIGH]
-Proto + 0x08 = ptr   - upvalue-related (0 = skip upvalue init)         [LOW]
-Proto + 0x10 = ptr   - upvalue-related (0 = skip upvalue init)         [LOW]
-Proto + 0x18 = ???   - passed to g->cb.interrupt as 2nd argument       [MED]
-Proto + 0x38 = k     (TValue* - constants array)                       [HIGH]
-Proto + 0x40 = code  (Instruction* - bytecode array, stored into
-                      ci->savedpc at call time)                         [HIGH]
+                        confirmed in multiple opcode handlers)               [HIGH]
+Proto + 0x06 = byte  - 5th header byte (present in bytecode version 4+)    [HIGH]
+Proto + 0x07 = byte  - 1st bytecode header byte                             [HIGH]
 
-// Gap Proto+0x20 through +0x37 still unknown:
-// likely contains: sizek, sizecode, sizelineinfo, nups, p (nested protos ptr), etc.
+// GC linkage (set by allocator, skipped by loader):
+Proto + 0x08 = ptr   - next / GC linkage                                    [MED]
+Proto + 0x10 = ptr   - gclist                                               [MED]
+
+// Interrupt hook argument:
+Proto + 0x18 = ???   - passed to g->cb.interrupt as 2nd argument            [MED]
+
+// Buffer / code pointers:
+Proto + 0x20 = ptr   - raw compressed bytecode/lineinfo buffer (input to
+                        deobfuscation; source for the code[] array)         [HIGH]
+Proto + 0x30 = ptr   - code base after deobfuscation (execdata base?)      [MED]
+Proto + 0x38 = k     - TValue* constants array                              [HIGH]
+Proto + 0x40 = code  - Instruction* bytecode array (stored into
+                        ci->savedpc at call time)                           [HIGH]
+Proto + 0x50 = ptr   - compressed lineinfo buffer                           [HIGH]
+Proto + 0x58 = TString* - source filename / chunkname                       [HIGH]
+Proto + 0x60 = ptr   - p[] nested proto array (Proto**)                     [HIGH]
+Proto + 0x68 = ptr   - lineinfo delta / jump table                          [HIGH]
+Proto + 0x70 = ptr   - upvalue name array (TString**)                       [HIGH]
+Proto + 0x78 = ptr   - locvar array (LocVar*)                               [HIGH]
+Proto + 0x80 = TString* - debug name                                        [HIGH]
+
+// Size / count fields:
+Proto + 0x88 = uint  - raw buffer size (byte count for buffer at +0x20)     [HIGH]
+Proto + 0x8c = int   - index of this proto in parent's p[] array            [HIGH]
+Proto + 0x90 = int   - lineinfo allocation size                             [HIGH]
+Proto + 0x94 = byte  - linegaplog2 (log2 of line gap for compressed info)  [HIGH]
+Proto + 0x98 = uint  - sizek (constants count)                              [HIGH]
+Proto + 0x9c = uint  - sizelocvars                                          [HIGH]
+Proto + 0xa0 = uint  - sizep (nested proto count)                           [HIGH]
+Proto + 0xa4 = uint  - sizeupvalues                                         [HIGH]
+Proto + 0xa8 = uint  - linedefined (source line where function starts)      [HIGH]
+Proto + 0xac = uint  - sizecode                                             [HIGH]
 ```
-
-> **Proto+0x04 confirmed:** `luaD_precall` branches on `pcVar9[4] == 0` (byte at Proto+0x04).
-> When zero (non-vararg), it executes `L->top = ci->top`, capping the stack to exactly
-> `numparams` slots. This is precisely the `is_vararg` branch documented in the Luau source.
->
-> **Proto+0x05 conflict resolved:** An earlier session labeled Proto+0x05 as `numparams`. It is
-> `maxstacksize`. Confirmed by two separate paths: the nil-fill loop in `luaD_precall`
-> (which uses it as a slot count) and direct reads in multiple opcode handlers immediately
-> after loading Proto*.
 
 ---
 
@@ -281,7 +317,7 @@ node + 0x1c = packed uint32:                                   [HIGH]
                 bits [31:4]  = next offset (signed, in LuaNode units of 0x20 bytes)
 ```
 
-Hash lookup: `bucket = TString->hash & nodemask` (Table+0x03).  
+Hash lookup: `bucket = TString->hash & nodemask` (Table+0x03).
 Chain end: `node+0x1c < 0x10` - means next==0 and key==nil (empty or end of chain).
 
 ---
@@ -339,14 +375,6 @@ g + 0x70  = ???         (GCObject* - GC traversal list head #2;
                           init → &g+0x58 sentinel; same caveat as g+0x68) [MED]
 
 // g+0x78 through g+0x30f: GC list block (rootgc, weak, allweak, etc.) - needs luaC_step
-
-// Extended Roblox-specific region (all zeroed on init except g+0x510):
-g + 0x500 = ???         (8 bytes - zeroed)                               [LOW]
-g + 0x508 = ???         (8 bytes - zeroed)                               [LOW]
-g + 0x510 = ???         (size_t or uint - set to 1 by lua_newstate;
-                          unique non-zero init in this region; purpose
-                          unknown - possibly a version flag or ref count) [LOW]
-g + 0x518 = ???         (zeroed; further fields continue to ~g+0x768)   [LOW]
 
 g + 0x310 = mainthread  (lua_State*)                                      [HIGH]
 g + 0x318 = ???         (8 bytes - between mainthread and tmname[0])      [LOW]
@@ -416,11 +444,26 @@ g + 0x4a8 = ???     (uint32 - 0x70000000 on init; confirmed via lua_newstate
 
 // Roblox sandbox / callback hooks:
 g + 0x4b8 = global_set_hook  (fn ptr - Roblox sandbox interceptor)       [MED]
+g + 0x4e8 = cb fn ptr        (atom assignment callback - called with
+                               TString* + atom field on string interning)  [MED]
+g + 0x4f0 = native executor  (fn ptr - called as fn(L, ctx*) by
+                               luaV_ncg_call; NULL when NCG inactive;
+                               busy-waited on by luaV_ncg_loop until
+                               non-null before invoking native code)       [HIGH]
 g + 0x540 = cb.userdata      (void*)                                      [MED]
 g + 0x548 = cb.interrupt     (fn ptr - called at luaV_execute entry when
                                ci->flags bit 2 is set; receives (L, Proto*)) [HIGH]
 g + 0x550 = cb.panic         (fn ptr)                                     [MED]
 g + 0x558 = cb.userthread    (fn ptr)                                     [MED]
+g + 0x560 = cb fn ptr        (Roblox-specific hook; purpose unknown)      [MED]
+
+// Extended Roblox-specific region (all zeroed on init except g+0x510):
+g + 0x500 = ???         (8 bytes - zeroed)                               [LOW]
+g + 0x508 = ???         (8 bytes - zeroed)                               [LOW]
+g + 0x510 = ???         (size_t or uint - set to 1 by lua_newstate;
+                          unique non-zero init in this region; purpose
+                          unknown - possibly a version flag or ref count) [LOW]
+g + 0x518 = ???         (zeroed; further fields continue to ~g+0x768)   [LOW]
 
 // Per-memory-category size tracking (confirmed from lua_newstate bzero pattern):
 g + 0x2c00 = memsize[256]  (size_t[256] - per-memcat byte totals; init:
@@ -489,64 +532,163 @@ Catch sites in `lua_resume` / `luaD_pcall` use `try/catch` blocks - not `setjmp`
 
 ## Opcode Dispatch
 
-> ⚠️ **Roblox shuffles opcode byte values per build.** The first byte of each Luau
-> instruction is NOT the raw opcode enum from the open-source Luau repo. Roblox
-> randomizes the mapping each release as an anti-tamper measure. Any table that claims
-> "opcode 5 = LOP_LOADK" is giving you a shuffled byte value specific to one build,
-> not a portable constant. Do not cross-reference these numbers with Luau source.
+> ⚠️ **Roblox uses a three-layer opcode shuffle per build.** No value in this section
+> directly corresponds to the open-source Luau opcode enum. Do not cross-reference these
+> numbers with Luau source.
 
-The dispatch table lives at `DAT_05daf138`. Each entry is an 8-byte pointer.
-~76 of 256 slots are non-null (out-of-line handlers). The rest are handled inline
-in the main interpreter loop at `0x03f7b00c`.
+### Three-layer shuffle pipeline
 
-Jython to dump the full table for your build:
+```
+Standard Luau enum  (0, 1, 2 ... LOP_NOP, LOP_BREAK, LOP_LOADNIL ...)
+        ↓  per-build file-format shuffle (unknown table, applied at compile time)
+File opcode byte    (stored in .luac bytecode on disk)
+        ↓  DAT_04ebdd10[file_byte]  applied by luaU_undump at load time
+Runtime opcode byte (stored in Proto->code[] in memory)
+        ↓  DAT_05daf138[runtime_byte * 8]  dereferenced at execute time
+Handler address     (the actual function or inline dispatch branch)
+```
+
+- **`DAT_04ebdd10`** (`0x04ebdd10`) - 256-byte unshuffle table. Indexed by file opcode byte, produces the runtime opcode byte. Applied in-place by `luaU_undump` during deserialization: `*pbVar32 = DAT_04ebdd10[*pbVar32]`.
+- **`DAT_04ebde10`** (`0x04ebde10`) - 256-byte instruction size table. Indexed by the value produced by `DAT_04ebdd10`. The raw bytes are **encoded** - `FUN_03035e5c` (`luaO_instcount`) applies a transformation before the result is used as the instruction word count. Do not read sizes from this table directly without decompiling that function.
+- **`DAT_05daf138`** - 256-entry pointer dispatch table (8 bytes per entry). Indexed by runtime opcode byte. ~76 of 256 slots non-null (out-of-line handlers); the rest are handled inline in `luaV_execute`.
+
+> ⚠️ **The "canonical" column in the scripts below is NOT the Luau enum ordinal.** It is the
+> value produced by `DAT_04ebdd10[runtime_byte]` - a third intermediate byte, not the open-
+> source opcode number. The full file→enum mapping requires decompiling the file-format shuffle.
+
+### Jython - dump full handler table with runtime/canonical columns
+
 ```python
-base = toAddr(0x05daf138)
+size_base      = toAddr(0x04ebde10)
+unshuffle_base = toAddr(0x04ebdd10)
+dispatch_base  = toAddr(0x05daf138)
+
 for i in range(256):
     try:
-        ptr = getLong(base.add(i * 8))
+        ptr = getLong(dispatch_base.add(i * 8))
         if ptr != 0:
-            print("opcode 0x%02x -> 0x%08x" % (i, ptr))
+            canonical = getByte(unshuffle_base.add(i)) & 0xff
+            sz = getByte(size_base.add(canonical)) & 0xff
+            print("runtime=0x%02x canonical=0x%02x size_byte=0x%02x handler=0x%08x" % (i, canonical, sz, ptr))
     except: pass
 ```
 
-**Confirmed handler addresses for 2.720.1164** (shuffled byte → handler):
+### Jython - label all handlers in Ghidra
+
+```python
+dispatch_base  = toAddr(0x05daf138)
+unshuffle_base = toAddr(0x04ebdd10)
+
+for i in range(256):
+    try:
+        ptr = getLong(dispatch_base.add(i * 8))
+        if ptr != 0:
+            canonical = getByte(unshuffle_base.add(i)) & 0xff
+            handler_addr = toAddr(ptr)
+            sym = "opcode_handler_r%02x_c%02x" % (i, canonical)
+            createLabel(handler_addr, sym, True)
+    except: pass
 ```
-0x00 -> 0x03f7b090      0x03 -> 0x03f7bc60      0x05 -> 0x03f7ba34
-0x06 -> 0x03f7bb2c      0x08 -> 0x03f7b9b4      0x10 -> 0x03f7e9f4
-0x16 -> 0x03f7bae4      0x1a -> 0x03f7b5e0      0x1d -> 0x03f7b688
-0x21 -> 0x03f7bbd4      0x22 -> 0x03f7ba18      0x25 -> 0x03f7beb8
-0x2b -> 0x03f7bb80      0x2d -> 0x03f7be74      0x2f -> 0x03f7b5c8
-0x30 -> 0x03f7bcd0      0x33 -> 0x03f7b4c4      0x37 -> 0x03f7be28
-0x38 -> 0x03f7b794      0x3a -> 0x03f7b9d0      0x3f -> 0x03f7bdf8
-0x42 -> 0x03f7b8b4      0x47 -> 0x03f7b8f4      0x4a -> 0x03f7bc8c
-0x4e -> 0x03f7d318      0x55 -> 0x03f7b4a4      0x57 -> 0x03f7d388
-0x58 -> 0x03f7c23c      0x5d -> 0x03f7bf74      0x5e -> 0x03f7d2fc
-0x62 -> 0x03f7d418      0x66 -> 0x03f7d1a0      0x69 -> 0x03f7d2cc
-0x6a -> 0x03f7d4d8      0x6b -> 0x03f7b3ac      0x6d -> 0x03f7c254
-0x70 -> 0x03f7ced8      0x77 -> 0x03f7ce64      0x7c -> 0x03f7d598
-0x7f -> 0x03f7c0b0      0x80 -> 0x03f7d504      0x81 -> 0x03f7bab8
-0x82 -> 0x03f7d1ec      0x84 -> 0x03f7ce28      0x89 -> 0x03f7b3d8
-0x8c -> 0x03f7bd7c      0x8e -> 0x03f7d164      0x90 -> 0x03f7b20c
-0x92 -> 0x03f7d0dc      0xa0 -> 0x03f7b50c      0xa2 -> 0x03f7d670
-0xa4 -> 0x03f7d458      0xa5 -> 0x03f7d3d0      0xa6 -> 0x03f7b350
-0xa7 -> 0x03f7c1b4      0xa9 -> 0x03f7d024      0xab -> 0x03f7b35c
-0xb1 -> 0x03f7c110      0xb2 -> 0x03f7d550      0xb3 -> 0x03f7e824
-0xb5 -> 0x03f7b71c      0xb8 -> 0x03f7bad8      0xc1 -> 0x03f7d48c
-0xc7 -> 0x03f7e93c      0xc9 -> 0x03f7d7a0      0xd5 -> 0x03f7d624
-0xd6 -> 0x03f7d098      0xd9 -> 0x03f7cea0      0xdb -> 0x03f7cfe4
-0xdf -> 0x03f7b0b8      0xe0 -> 0x03f7d804      0xe4 -> 0x03f7b3bc
-0xe6 -> 0x03f7b1e4      0xe7 -> 0x03f7cdcc      0xe8 -> 0x03f7cf9c
-0xea -> 0x03f7c294      0xeb -> 0x03f7d118      0xed -> 0x03f7d840
-0xee -> 0x03f7bd1c      0xf0 -> 0x03f7d5e0      0xf2 -> 0x03f7bf00
-0xf3 -> 0x03f7b57c      0xf4 -> 0x03f7cf54      0xf5 -> 0x03f7cdfc
-0xf6 -> 0x03f7d7d0      0xf9 -> 0x03f7cf04
+
+### Known handler table for 2.720.1164 (runtime / canonical / handler)
+
+`size_byte` values are encoded - see `FUN_03035e5c` note above.
+
+```
+runtime  canonical  size_byte  handler       notes
+0x00     0xb8       0x00       0x03f7b090
+0x03     0xb9       0x61       0x03f7bc60
+0x05     0xe9       0xf7       0x03f7ba34
+0x06     0x2a       0xc2       0x03f7bb2c
+0x08     0x3d       0x58       0x03f7b9b4
+0x10     0x9d       0xb0       0x03f7e9f4    ← CALL (→ luaD_precall at 0x03f7e9f8)
+0x16     0xcd       0x72       0x03f7bae4
+0x1a     0x4d       0x9e       0x03f7b5e0
+0x1d     0xc0       0xff       0x03f7b688
+0x21     0x2b       0x2b       0x03f7bbd4
+0x22     0xd0       0xf6       0x03f7ba18
+0x25     0xb4       0x57       0x03f7beb8
+0x2b     0x3f       0x19       0x03f7bb80
+0x2d     0x79       0xaf       0x03f7be74
+0x2f     0x55       0x45       0x03f7b5c8
+0x30     0x47       0x10       0x03f7bcd0
+0x33     0xa3       0x71       0x03f7b4c4
+0x37     0x1c       0x9d       0x03f7be28
+0x38     0x15       0x68       0x03f7b794
+0x3a     0x51       0xfe       0x03f7b9d0
+0x3f     0x4f       0xf5       0x03f7bdf8
+0x42     0x96       0x56       0x03f7b8b4
+0x47     0x70       0x4d       0x03f7b8f4
+0x4a     0xec       0xae       0x03f7bc8c
+0x4e     0x0f       0xda       0x03f7d318
+0x55     0xc5       0x67       0x03f7b4a4
+0x57     0x6f       0xfd       0x03f7d388
+0x58     0x35       0xc8       0x03f7c23c
+0x5d     0x5a       0xbf       0x03f7bf74
+0x5e     0xfa       0x8a       0x03f7d2fc
+0x62     0x8d       0xb6       0x03f7d418
+0x66     0x17       0xe2       0x03f7d1a0
+0x69     0x08       0x43       0x03f7d2cc
+0x6a     0x1a       0x0e       0x03f7d4d8
+0x6b     0x72       0xd9       0x03f7b3ac
+0x6d     0x7b       0x6f       0x03f7c254
+0x70     0x3c       0xd0       0x03f7ced8
+0x77     0x93       0x5d       0x03f7ce64
+0x7c     0x5d       0x54       0x03f7d598
+0x7f     0x9f       0xb5       0x03f7c0b0
+0x80     0x9c       0x80       0x03f7d504
+0x81     0xa0       0x4b       0x03f7bab8
+0x82     0xb3       0x16       0x03f7d1ec
+0x84     0xbb       0xac       0x03f7ce28
+0x89     0xfe       0xa3       0x03f7b3d8
+0x8c     0x81       0x04       0x03f7bd7c
+0x8e     0x23       0x9a       0x03f7d164
+0x90     0xc1       0x30       0x03f7b20c
+0x92     0x2c       0xc6       0x03f7d0dc
+0xa0     0x99       0xe0       0x03f7b50c
+0xa2     0x29       0x76       0x03f7d670
+0xa4     0xea       0x0c       0x03f7d458
+0xa5     0xde       0xd7       0x03f7d3d0
+0xa6     0xd3       0xa2       0x03f7b350
+0xa7     0xae       0x6d       0x03f7c1b4
+0xa9     0xe6       0x03       0x03f7d024
+0xab     0xe5       0x99       0x03f7b35c
+0xb1     0x28       0x5b       0x03f7c110
+0xb2     0x3a       0x26       0x03f7d550
+0xb3     0xb7       0xf1       0x03f7e824
+0xb5     0x26       0x87       0x03f7b71c
+0xb8     0xaa       0xe8       0x03f7bad8
+0xc1     0xf5       0x0b       0x03f7d48c
+0xc7     0xcb       0xcd       0x03f7e93c
+0xc9     0x68       0x63       0x03f7d7a0
+0xd5     0xbe       0xe7       0x03f7d624
+0xd6     0x40       0xb2       0x03f7d098
+0xd9     0x82       0x13       0x03f7cea0
+0xdb     0x78       0xa9       0x03f7cfe4
+0xdf     0xc4       0xd5       0x03f7b0b8
+0xe0     0x6c       0xa0       0x03f7d804
+0xe4     0x8f       0xcc       0x03f7b3bc
+0xe6     0xaf       0x62       0x03f7b1e4
+0xe7     0xa4       0x2d       0x03f7cdcc
+0xe8     0x49       0xf8       0x03f7cf9c
+0xea     0xd1       0x8e       0x03f7c294
+0xeb     0xfb       0x59       0x03f7d118
+0xed     0x0c       0xef       0x03f7d840
+0xee     0xa1       0xba       0x03f7bd1c
+0xf0     0x62       0x50       0x03f7d5e0
+0xf2     0xbf       0xe6       0x03f7bf00
+0xf3     0x60       0xb1       0x03f7b57c
+0xf4     0xdd       0x7c       0x03f7cf54
+0xf5     0xb2       0x47       0x03f7cdfc
+0xf6     0x05       0x12       0x03f7d7d0
+0xf9     0x34       0x73       0x03f7cf04
 ```
 
 **luaV_execute internals:**
 ```
 0x03f7747c = luaV_execute_dispatch  (trampoline - checks L+0x06 for NCG path)
-0x03f7490  = luaV_execute_native    (NCG / native code path)
+0x03f77490 = luaV_ncg_loop          (outer NCG dispatch loop - see VM Core section)
+0x03f772e0 = luaV_ncg_call          (NCG call trampoline - see VM Core section)
 0x03f7b00c = luaV_execute           (main bytecode interpreter loop)
 ```
 
@@ -606,9 +748,29 @@ Thread status (`L+0x03`):
 
 ### VM Core
 ```
-0x03f7747c = luaV_execute_dispatch   trampoline; checks L+0x06 for NCG
-0x03f77490 = luaV_execute_native     NCG/native execution path
+0x03f7747c = luaV_execute_dispatch   trampoline; checks L+0x06 for NCG path;
+                                      if NCG active calls luaV_ncg_loop (0x03f77490),
+                                      else falls through to luaV_execute
+0x03f77490 = luaV_ncg_loop           outer NCG dispatch loop:
+                                        - reads ci->savedpc
+                                        - busy-waits on g+0x4f0 until native executor
+                                          pointer is non-null
+                                        - skips marker opcodes 0xa7 and 0xf3
+                                          (NCG placeholder bytes in code[])
+                                        - calls luaV_ncg_call (0x03f772e0)
+                                        - loops while L->status == 0
+0x03f772e0 = luaV_ncg_call           NCG call trampoline (param_2 = g+0x4f0 fn):
+                                        - saves/restores BREAK(0x06)/YIELD(0x01) state
+                                        - advances ci->savedpc past the calling insn
+                                        - allocates 20 TValue (0x140 byte) scratch space
+                                        - calls luaG_getline for Lua closures
+                                        - invokes (*param_2)(L, &ctx)
+                                        - relocates all stack pointers after call
+                                          (handles potential stack realloc during native)
 0x03f7b00c = luaV_execute            main bytecode interpreter loop
+0x03f7e9f4 = opcode_CALL             CALL handler; 4 bytes before luaD_precall -
+                                      reads instruction word and extracts register
+                                      fields before falling through into precall
 0x03f7e9f8 = luaD_precall            (lua_State*, StkId func, int nresults)
 0x03f7ebcc = luaD_poscall            (lua_State*, StkId firstResult)
 0x03f67d40 = resume_execute_loop     post-resume driver (internal name unknown)
@@ -642,7 +804,18 @@ Thread status (`L+0x03`):
 ### Memory
 ```
 0x03f6d7e4 = luaM_newobject          (lua_State*, size_t, memcat) -> void*
+0x03f6d65c = luaM_newvector          sized memory allocator helper
 0x03f6d648 = luaG_toobig             no return - string > 0x40000000 bytes
+```
+
+### Bytecode / Protos
+```
+0x03f7ef1c = luaU_undump             bytecode loader (the full deserialization loop)
+0x03f67e24 = luaF_newproto           Proto allocator
+0x03035e5c = luaO_instcount          (byte canonical_opcode) -> int word_count
+                                      applies transformation to DAT_04ebde10[canonical]
+                                      to produce actual instruction word count (1 or 2)
+                                      ⚠ decompile needed to decode DAT_04ebde10 values
 ```
 
 ### Strings
@@ -675,6 +848,9 @@ Thread status (`L+0x03`):
 0x03f661c8 = luaG_aritherror
 0x03f66240 = luaG_ordererror
 0x03f662b4 = luaG_indexerror
+0x03f66610 = luaG_getline            (Proto*, int instruction_index) -> int line_number
+                                      called by luaV_ncg_call to get line info for
+                                      Lua closures before invoking native executor
 ```
 
 ### GC (partial - needs luaC_step analysis)
@@ -712,9 +888,16 @@ Thread status (`L+0x03`):
 ```
 DAT_04ebdbc0 = nil TValue sentinel    luaH_getstr / luaT_gettmbyobj miss - DO NOT WRITE
 DAT_04ebdcd0 = dummy LuaNode          Table->node for empty tables - DO NOT WRITE
+DAT_04ebdd10 = opcode unshuffle table 256 bytes; DAT_04ebdd10[runtime_byte] = canonical
+                                       Applied in-place by luaU_undump during load.
+                                       NOTE: "canonical" ≠ Luau enum ordinal.
+DAT_04ebde10 = instruction size table 256 bytes; indexed by canonical (from above).
+                                       Values are encoded - use luaO_instcount
+                                       (FUN_03035e5c) to get actual word count.
 DAT_05dae828 = vector lib luaL_Reg[]
 DAT_05dadd88 = lua_exception vtable
-DAT_05daf138 = opcode dispatch table  ptr[256], 8 bytes per entry
+DAT_05daf138 = opcode dispatch table  ptr[256], 8 bytes per entry;
+                                       indexed by runtime opcode byte
 DAT_05fabec8 = feature flag           0x01 = coroutine-extended behavior
 DAT_05fabf10 = feature flag           checked in lua_newstate
 ```
@@ -726,7 +909,7 @@ DAT_05fabf10 = feature flag           checked in lua_newstate
 | Target | What it unlocks | Priority |
 |---|---|---|
 | GC functions (`luaC_step` etc.) | Distinguishes g+0x68 vs g+0x70 (grayagain/weak/allweak); closes g+0x78→g+0x30f GC list block | High |
-| `Proto+0x20`→`+0x37` gap | sizek, sizecode, nups, nested proto array | High |
+| `FUN_03035e5c` (`luaO_instcount`) full decompile | Decodes DAT_04ebde10 size bytes → actual instruction word counts; identifies all AUX-word opcodes (LOADKX, CAPTURE, FASTCALL variants, JUMPXEQK*) | High |
 | `g+0x30`, `g+0x318` | Zeroed unknowns; need `lua_resume` full body or upvalue fns | Med |
 | `L+0x78` | NULL on init; need CLOSE opcode handler or `luaF_close` | Med |
 | `g+0x510` | = 1 on init; purpose unknown - could be a version flag or memcat ref count | Med |
@@ -736,6 +919,8 @@ DAT_05fabf10 = feature flag           checked in lua_newstate
 | `Table+0x06`, `+0x07` | Zeroed on init; likely padding | Low |
 | `g+0x488`→`g+0x497` | 12 bytes between `mt[]` end and registry | Low |
 | `g+0x4a8` | 0x70000000 confirmed present; purpose (memory cap?) still unknown | Low |
+| `Proto+0x18` | Passed to g->cb.interrupt as 2nd arg - likely a proto ID or line hint | Low |
+| `Proto+0x30` | Ptr written after deobfuscation; may be execdata/native code base | Low |
 
 ---
 
