@@ -784,7 +784,7 @@ Thread status (`L+0x03`):
                                       Writes frealloc/ud/panic/gcparams/mainthread.
                                       Calls luaD_rawrunprotected(L, luaE_newstate).
                                       Returns NULL on failure.
-0x03f675c8 = lua_resume
+0x03f67530 = lua_resume
 0x03f6523c = lua_closethread
 0x03f6f478 = luaD_initstack          (lua_State* L, lua_State* mainthread)
 0x03f6fac4 = luaE_newstate           called under protection by lua_newstate
