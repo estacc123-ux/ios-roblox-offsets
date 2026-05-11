@@ -18,11 +18,6 @@ also check out he funny: https://github.com/60ve/roblox-ios-offsets
 
 
 ### **NOTE: iOS AC is disabled, and only luau and other detections that no one knows of are enabled, and there's no such detectiions that will crash you**
-### **DISCOVERY:**
-lua_resume = `0x03f674dc`
-precheck = `0x03f67530`
-resume engine = `0x03f675c8`
-post cleanup = `0x03f676dc`
 
 ---
 
