@@ -80,6 +80,9 @@ L + 0x03 = status       (byte)                                                  
               0x7f = running
 L + 0x04 = active_memcat (byte - memcat used for new objects allocated on
                            behalf of this thread; distinct from L+0x01)          [HIGH]
+L + 0x05 = isactive     (bool - set true in resume_start before threadbarrier;
+                          confirmed by resume_start: *(L+5) = 1, immediately
+                          followed by luaC_threadbarrier call)                   [HIGH]
 L + 0x06 = native_exec  (byte - 0x01 = NCG/native code path active)             [MED]
 L + 0x08 = stacksize    (int)                                                    [HIGH]
 L + 0x0c = size_ci      (int - 8 on init)                                       [HIGH]
@@ -91,8 +94,16 @@ L + 0x38 = ci           (CallInfo*)                                             
 L + 0x40 = base         (StkId - current frame base)                            [HIGH]
 L + 0x58 = end_ci       (CallInfo*)                                              [HIGH]
 L + 0x60 = base_ci      (CallInfo*)                                              [HIGH]
+L + 0x68 = nCcalls      (ushort - C call depth; copied from from->nCcalls in
+                          resume_start, checked >= LUAI_MAXCCALLS (200),
+                          then incremented)                                      [HIGH]
+L + 0x6a = baseCcalls   (ushort - set to L->nCcalls after increment in
+                          resume_start; used for yieldability tracking)          [HIGH]
 L + 0x70 = gt           (Table* - _G global environment)                        [HIGH]
-L + 0x78 = ???          (pointer - NULL on init, purpose unknown)                [LOW]
+L + 0x78 = openupval    (UpVal* - linked list head of open upvalues on this
+                          thread's stack; walked by luaD_reallocstack to
+                          relocate value pointers after stack resize;
+                          NULL on init)                                          [HIGH]
 
 sizeof(lua_State) = 0x80
 ```
@@ -156,16 +167,25 @@ Permanently pinned strings (marked |= 8 in `luaE_newstate`):
 > Layout read directly from `luaD_precall`'s store sequence into a freshly allocated `CallInfo`.
 
 ```cpp
-ci + 0x00 = top      (StkId - frame ceiling: func + numparams*0x10)          [HIGH]
+ci + 0x00 = top      (StkId - frame ceiling: func + stacksize*0x10)          [HIGH]
 ci + 0x08 = savedpc  (Instruction* - 0 on C call, Proto->code on Lua call)   [HIGH]
 ci + 0x10 = base     (StkId - first arg / frame base)                        [HIGH]
 ci + 0x18 = func     (StkId - ptr to function TValue on stack)               [HIGH]
 ci + 0x20 = nresults (int - expected return count; -1 = LUA_MULTRET)         [HIGH]
-ci + 0x24 = flags    (int)                                                    [MED]
-              bit 0 = CIST_YIELDABLE  (set during lua_resume)
-              bit 2 = interrupt pending (checked at luaV_execute entry;
-                      triggers g->cb.interrupt call before dispatch)
+ci + 0x24 = flags    (int)                                                    [HIGH]
+              bit 0 = LUA_CALLINFO_RETURN  (set during lua_resume on the
+                       resuming frame; ci->flags |= 1)
+              bit 1 = LUA_CALLINFO_HANDLE  (checked by lua_resumeerror when
+                       walking the CI chain looking for an error handler)
+              bit 2 = LUA_CALLINFO_NATIVE  (set by luaD_precall when
+                       proto->execdata or proto->code is non-null; signals
+                       that this frame should execute via native code)
 ```
+
+> **Flag name correction:** "CIST_YIELDABLE" does not exist in Luau - that is a Lua 5.3
+> concept. Luau uses `baseCcalls` (L+0x6a) for yieldability tracking. The correct flag names
+> are `LUA_CALLINFO_RETURN` (bit 0), `LUA_CALLINFO_HANDLE` (bit 1), and
+> `LUA_CALLINFO_NATIVE` (bit 2), all from Luau's lstate.h.
 
 ---
 
@@ -175,22 +195,30 @@ ci + 0x24 = flags    (int)                                                    [M
 Closure + 0x00 = tt         (byte - 0x08 = LUA_TFUNCTION)                  [HIGH]
 Closure + 0x01 = memcat     (byte)                                          [HIGH]
 Closure + 0x02 = marked     (byte - GC flags)                               [HIGH]
-Closure + 0x03 = numparams  (byte - parameter slot count; cached from Proto
-                              for fast frame sizing in luaD_precall)        [HIGH]
-Closure + 0x04 = unknown    (byte)                                          [LOW]
+Closure + 0x03 = stacksize  (byte - max stack slots needed by this closure;
+                              used by luaD_precall to set ci->top:
+                              ci->top = L->top + stacksize * sizeof(TValue);
+                              NOT numparams - that is a separate field in Proto) [HIGH]
+Closure + 0x04 = nupvalues  (byte - upvalue count; likely)                  [MED]
 Closure + 0x05 = isC        (byte - 0 = Lua closure, nonzero = C closure)  [HIGH]
-Closure + 0x08 = next       (GCObject* - GC linkage, inferred from TString pattern) [MED]
-Closure + 0x10 = gclist     (GCObject* - GC gray list chain pointer;
-                              confirmed via luaC_barrier prepend pattern)   [HIGH]
+Closure + 0x08 = ???        (unknown – likely padding or moved field)   [LOW]
+Closure + 0x10 = gclist     (GCObject* - GC gray list chain pointer; confirmed) [HIGH]
 Closure + 0x18 = Proto*     (Lua closures) / lua_CFunction (C closures)    [HIGH]
 Closure + 0x28 = cont*      (C closures only - continuation fn ptr;
                               NULL = not yieldable across this call)        [HIGH]
 ```
 
-> **Closure+0x03 correction:** Earlier notes listed this as possibly `nupvalues`. It is
-> `numparams`. `luaD_precall` reads it directly as the parameter slot count for frame
-> sizing: `ci->top = base + numparams * sizeof(TValue)`. The binary caches numparams in
-> the Closure instead of reading it from Proto at every call.
+> **Closure+0x03 correction:** Previously listed as `numparams`. It is `stacksize`.
+> `luaD_precall` reads it to set the frame ceiling (`ci->top`), not to copy arguments.
+> This matches open-source Luau's Closure struct where `stacksize` is the cached max-stack
+> field. `numparams` lives in Proto and is used for argument copying, not frame sizing.
+>
+> **Closure+0x08 correction:** Previously listed as `next (GCObject*)` inferred from TString
+> pattern. That is wrong. Luau's `CommonHeader` is `{tt, marked, memcat}` - there is no
+> `next` pointer in it. Luau uses page-based GC allocation; objects do not form per-object
+> linked lists. The field at +0x08 is `gclist` (the GC gray list chain), consistent with
+> all other GC objects in this binary. `TString+0x08` is a hash-chain `next` pointer
+> specific to the string intern table and should not be generalized.
 >
 > **Closure+0x10:** Confirmed `gclist` via `luaC_barrier` - the barrier prepends GC objects
 > to the gray list by writing `obj->gclist = g->gray` then `g->gray = obj`, with the gclist
@@ -204,10 +232,13 @@ Closure + 0x28 = cont*      (C closures only - continuation fn ptr;
 > field during deserialization. Fields +0x08 and +0x10 are NOT written by the loader; they
 > are GC linkage set by the allocator (`luaF_newproto`, `FUN_03f67e24`), consistent with
 > the pattern on all other GC objects.
+>
+> **sizeof(Proto) = 0xb0**, confirmed by `luaF_newproto`: `FUN_03f6d7e4(param_1, 0xb0, ...)`.
+> **tt = 0x0c (LUA_TPROTO)**, confirmed by `luaF_newproto`: `*puVar1 = 0xc`.
 
 ```cpp
 // GC header (set by luaF_newproto, not written by luaU_undump):
-Proto + 0x00 = tt       (byte - LUA_TPROTO)                                 [MED]
+Proto + 0x00 = tt       (byte - 0x0c = LUA_TPROTO)                         [HIGH]
 Proto + 0x01 = memcat   (byte)                                              [MED]
 Proto + 0x02 = marked   (byte - GC flags)                                   [MED]
 
@@ -226,7 +257,10 @@ Proto + 0x08 = ptr   - next / GC linkage                                    [MED
 Proto + 0x10 = ptr   - gclist                                               [MED]
 
 // Interrupt hook argument:
-Proto + 0x18 = ???   - passed to g->cb.interrupt as 2nd argument            [MED]
+Proto + 0x18 = ptr   - interrupt callback context arg; passed to
+                        g->cb.interrupt as 2nd argument at luaV_execute
+                        entry (confirmed: luaV_execute calls
+                        g->cb.interrupt(L, proto+0x18))                     [MED]
 
 // Buffer / code pointers:
 Proto + 0x20 = ptr   - raw compressed bytecode/lineinfo buffer (input to
@@ -238,7 +272,7 @@ Proto + 0x40 = code  - Instruction* bytecode array (stored into
 Proto + 0x50 = ptr   - compressed lineinfo buffer                           [HIGH]
 Proto + 0x58 = TString* - source filename / chunkname                       [HIGH]
 Proto + 0x60 = ptr   - p[] nested proto array (Proto**)                     [HIGH]
-Proto + 0x68 = ptr   - lineinfo delta / jump table                          [HIGH]
+Proto + 0x68 = ptr   - abslineinfo / jump table                             [HIGH]
 Proto + 0x70 = ptr   - upvalue name array (TString**)                       [HIGH]
 Proto + 0x78 = ptr   - locvar array (LocVar*)                               [HIGH]
 Proto + 0x80 = TString* - debug name                                        [HIGH]
@@ -335,7 +369,7 @@ Userdata + 0x08 = metatable*  (Table* - NULL if none)  [HIGH]
 Access via `L->l_G`. Starts at `L+0x80` in the main-thread combined allocation.
 
 ```cpp
-g + 0x00  = nextgc      (size_t - GC threshold; init = totalbytes * 4)  [HIGH]
+g + 0x00  = GCthreshold (size_t - GC threshold; init = totalbytes * 4)  [HIGH]
 g + 0x08  = totalbytes  (size_t - 0x4710 on init = combined LG block)   [HIGH]
 
 // Written by lua_newstate:
@@ -353,11 +387,13 @@ g + 0x3c  = strt.nuse   (uint - interned string count)                   [HIGH]
 g + 0x40  = strt.hash   (TString** - bucket array)                       [HIGH]
 
 // GC parameters:
-g + 0x48  = gcpause     (uint32 - 200 on init)                           [HIGH]
+g + 0x48  = gcgoal      (uint32 - 200 on init; Luau name for what was
+                          "gcpause" in Lua 5.1)                           [HIGH]
 g + 0x4c  = gcstepmul   (uint32 - 200 on init)                           [HIGH]
-g + 0x50  = ???         (uint32 - 0x400 on init; possibly gcstepsize)    [MED]
-g + 0x54  = gccolor     (byte - 9 on init; bits[1:0]=mark color,
-                          bit[3]=GC phase flag)                           [MED]
+g + 0x50  = gcstepsize  (uint32 - 0x400 on init)                         [MED]
+g + 0x54  = currentwhite (byte - 9 on init; bits[1:0]=mark color,
+                           bit[3]=GC phase flag; Luau name for what was
+                           "gccolor" in Lua 5.1)                          [MED]
 g + 0x55  = gcstate     (byte - GC phase; value 2 = sweep phase, triggers
                           different barrier behavior in luaC_barrier)     [HIGH]
 
@@ -452,7 +488,8 @@ g + 0x4f0 = native executor  (fn ptr - called as fn(L, ctx*) by
                                non-null before invoking native code)       [HIGH]
 g + 0x540 = cb.userdata      (void*)                                      [MED]
 g + 0x548 = cb.interrupt     (fn ptr - called at luaV_execute entry when
-                               ci->flags bit 2 is set; receives (L, Proto*)) [HIGH]
+                               ci->flags bit 2 (LUA_CALLINFO_NATIVE) is
+                               set; receives (L, Proto+0x18 ctx arg))     [HIGH]
 g + 0x550 = cb.panic         (fn ptr)                                     [MED]
 g + 0x558 = cb.userthread    (fn ptr)                                     [MED]
 g + 0x560 = cb fn ptr        (Roblox-specific hook; purpose unknown)      [MED]
@@ -475,7 +512,7 @@ g + 0x15c0 = memsize[256]  (size_t[256] - per-memcat byte totals; init:
 // Roblox-specific large data blocks (extents from lua_newstate _bzero calls):
 g + 0x3400 = ???  (0x800 bytes zeroed - purpose unknown)                 [LOW]
 g + 0x3c00 = ???  (0x400 bytes zeroed - purpose unknown)                 [LOW]
-g + 0x4000 = ???  (0x410 bytes zeroed if DAT_05fabf10 flag is set)       [LOW]
+g + 0x4000 = ???  (0x410 bytes zeroed if FFlag::LuauStacklessPcall set)  [LOW]
 
 // sizeof(global_State) ≈ 0x4690 (allocation is 0x4710; lua_State is 0x80)
 ```
@@ -486,6 +523,9 @@ g + 0x4000 = ???  (0x410 bytes zeroed if DAT_05fabf10 flag is set)       [LOW]
 >
 > **g+0x55 correction:** Previously `[LOW]`. Confirmed `gcstate` (GC phase byte) via
 > `luaC_barrier`: `if (*(char*)(g + 0x55) == 2)` branches to the sweep-phase barrier path.
+>
+> **g+0x48 / g+0x54 naming:** `gcpause` and `gccolor` are Lua 5.1 field names. The correct
+> Luau names are `gcgoal` and `currentwhite`. Values and offsets are unchanged.
 >
 > **g+0x58 / g+0x68 / g+0x70:** Full `lua_newstate` decompile confirms both g+0x68 and g+0x70
 > are initialized to `puVar3+0x6c` = `&g+0x58`. This means g+0x58 is a sentinel object (not
@@ -722,6 +762,7 @@ x28 = frame base  (L->base, &reg[0])
 0x09 = LUA_TUSERDATA
 0x0a = LUA_TTHREAD
 0x0b = LUA_TBUFFER     (Luau-specific - typed byte buffer)
+0x0c = LUA_TPROTO      (internal - confirmed by luaF_newproto: *puVar1 = 0xc)
 ```
 
 ---
@@ -730,6 +771,7 @@ x28 = frame base  (L->base, &reg[0])
 
 ```cpp
 0x02 = LUA_ERRRUN
+0x03 = LUA_ERRSYNTAX
 0x04 = LUA_ERRMEM
 0x05 = LUA_ERRERR
 ```
@@ -773,7 +815,10 @@ Thread status (`L+0x03`):
                                       fields before falling through into precall
 0x03f7e9f8 = luaD_precall            (lua_State*, StkId func, int nresults)
 0x03f7ebcc = luaD_poscall            (lua_State*, StkId firstResult)
-0x03f67d40 = resume_execute_loop     post-resume driver (internal name unknown)
+0x03f67d40 = resume_continue         post-resume driver; loops while ci > base_ci:
+                                      if current closure isC calls continuation
+                                      (closure+0x28), else calls luaV_execute;
+                                      calls luau_poscall after C continuation returns
 0x03f81e98 = tryfuncTM               __call metamethod handler inside luaD_precall
 ```
 
@@ -784,7 +829,27 @@ Thread status (`L+0x03`):
                                       Writes frealloc/ud/panic/gcparams/mainthread.
                                       Calls luaD_rawrunprotected(L, luaE_newstate).
                                       Returns NULL on failure.
-0x03f67530 = lua_resume
+0x03f674dc = lua_resume              (lua_State* L, lua_State* from, int nargs)
+                                      Calls resume_start → if fail return →
+                                      luaD_rawrunprotected(L, resume, top-nargs) →
+                                      resume_finish. This is the real lua_resume.
+0x03f67530 = resume_start            static helper called first by lua_resume;
+                                      copies from->nCcalls to L->nCcalls, checks
+                                      >= LUAI_MAXCCALLS (200), sets isactive=true,
+                                      calls luaC_threadbarrier, sets baseCcalls
+0x03f675c8 = resume                  protected callback passed to rawrunprotected
+                                      by lua_resume; checks FFlag::LuauStacklessPcall,
+                                      calls luaD_precall, sets LUA_CALLINFO_RETURN
+0x03f676dc = resume_finish           called after rawrunprotected in lua_resume;
+                                      cleans up L->status and returns final status
+0x03f67808 = lua_resumeerror         pushes error onto stack with nargs=1, walks
+                                      CI chain checking LUA_CALLINFO_HANDLE (bit 1)
+0x03f67884 = resume_handle           protected callback passed to rawrunprotected
+                                      in lua_resumeerror
+0x03f67cb0 = resume_error            pushes error string onto stack, returns
+                                      LUA_ERRRUN (2)
+0x03f693c0 = luaC_threadbarrier      called in resume_start after isactive=true;
+                                      checks marked byte for GC barrier
 0x03f6523c = lua_closethread
 0x03f6f478 = luaD_initstack          (lua_State* L, lua_State* mainthread)
 0x03f6fac4 = luaE_newstate           called under protection by lua_newstate
@@ -796,7 +861,10 @@ Thread status (`L+0x03`):
 ```
 0x03f670a8 = luaD_growCI
 0x03f67010 = luaD_reallocCI
-0x03f66e4c = luaD_growstack          [MED]
+0x03f66e4c = luaD_reallocstack       (lua_State* L, int newsize, int fornewci)
+                                      3-param signature distinguishes it from
+                                      luaD_growstack (2 params); fornewci used in
+                                      overflow path to undo CI allocation
 0x03f67454 = luaD_seterrorobj
 0x03f66e08 = luaD_throw              C++ __cxa_throw wrapper, NOT longjmp
 ```
@@ -857,6 +925,8 @@ Thread status (`L+0x03`):
 ```
 0x03f6938c = luaC_barrier            GC write barrier (called on heap-obj store
                                       into black table)                     [MED]
+0x03f693c0 = luaC_threadbarrier      GC barrier for thread objects; called in
+                                      resume_start after L->isactive = true  [HIGH]
 ```
 
 ### Misc
@@ -898,7 +968,11 @@ DAT_05dae828 = vector lib luaL_Reg[]
 DAT_05dadd88 = lua_exception vtable
 DAT_05daf138 = opcode dispatch table  ptr[256], 8 bytes per entry;
                                        indexed by runtime opcode byte
-DAT_05fabec8 = feature flag           0x01 = coroutine-extended behavior
+DAT_05fabec8 = FFlag::LuauStacklessPcall  0x01 = enabled; controls whether the
+                                           new stackless pcall path is taken in
+                                           resume and resume_continue; both
+                                           FUN_03f675c8 and FUN_03f67d40 branch on
+                                           this value
 DAT_05fabf10 = feature flag           checked in lua_newstate
 ```
 
@@ -911,15 +985,13 @@ DAT_05fabf10 = feature flag           checked in lua_newstate
 | GC functions (`luaC_step` etc.) | Distinguishes g+0x68 vs g+0x70 (grayagain/weak/allweak); closes g+0x78→g+0x30f GC list block | High |
 | `FUN_03035e5c` (`luaO_instcount`) full decompile | Decodes DAT_04ebde10 size bytes → actual instruction word counts; identifies all AUX-word opcodes (LOADKX, CAPTURE, FASTCALL variants, JUMPXEQK*) | High |
 | `g+0x30`, `g+0x318` | Zeroed unknowns; need `lua_resume` full body or upvalue fns | Med |
-| `L+0x78` | NULL on init; need CLOSE opcode handler or `luaF_close` | Med |
 | `g+0x510` | = 1 on init; purpose unknown - could be a version flag or memcat ref count | Med |
 | `g+0x500`→`g+0x768` gap | Extended Roblox-specific region; callback struct boundaries unclear | Med |
 | `g+0x3400`, `g+0x3c00`, `g+0x4000` | Large _bzero'd blocks; likely Roblox sandbox data | Low |
-| `Closure+0x04` | Unknown byte between numparams and isC | Low |
+| `Closure+0x04` | Likely nupvalues - byte between stacksize and isC | Low |
 | `Table+0x06`, `+0x07` | Zeroed on init; likely padding | Low |
 | `g+0x488`→`g+0x497` | 12 bytes between `mt[]` end and registry | Low |
 | `g+0x4a8` | 0x70000000 confirmed present; purpose (memory cap?) still unknown | Low |
-| `Proto+0x18` | Passed to g->cb.interrupt as 2nd arg - likely a proto ID or line hint | Low |
 | `Proto+0x30` | Ptr written after deobfuscation; may be execdata/native code base | Low |
 
 ---
