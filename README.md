@@ -17,7 +17,7 @@
 also check out he funny: https://github.com/60ve/roblox-ios-offsets
 
 
-### **NOTE: iOS AC is disabled, and only luau and other detections that no one knows of are enabled**
+### **NOTE: iOS AC is disabled, and only luau and other detections that no one knows of are enabled, and there's no such detectiions that will crash you**
 
 ---
 
