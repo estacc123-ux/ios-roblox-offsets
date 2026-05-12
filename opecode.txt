@@ -1,3 +1,6 @@
+// note some could be wrong but since i havent fully verified all of it and im tired (this took hours... man i really hate this)
+
+
 FILE  RUNTIME  HANDLER       OPCODE
 -----------------------------------------------
 0x00  0xB8     0x03F7BAD8    LOP_NOP / BREAK
