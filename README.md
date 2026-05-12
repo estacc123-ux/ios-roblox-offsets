@@ -14,7 +14,7 @@
 > repo and wondering why everything is on fire. Android offsets coming later, been busy.
 
 
-also check out he funny: https://github.com/60ve/roblox-ios-offsets
+discord: [.Kit Discord Server](https://discord.gg/W4VKbahtqA)
 
 
 ### **NOTE: iOS AC is disabled, and only luau and other detections that no one knows of are enabled, and there's no such detectiions that will crash you**
