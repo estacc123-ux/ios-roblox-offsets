@@ -167,7 +167,7 @@ Permanently pinned strings (marked |= 8 in `luaE_newstate`):
 > Layout read directly from `luaD_precall`'s store sequence into a freshly allocated `CallInfo`.
 
 ```cpp
-ci + 0x00 = top      (StkId - frame ceiling: func + stacksize*0x10)          [HIGH]
+ci + 0x00 = top      (StkId - frame ceiling: L->top + stacksize * 0x10)        [HIGH]
 ci + 0x08 = savedpc  (Instruction* - 0 on C call, Proto->code on Lua call)   [HIGH]
 ci + 0x10 = base     (StkId - first arg / frame base)                        [HIGH]
 ci + 0x18 = func     (StkId - ptr to function TValue on stack)               [HIGH]
@@ -519,7 +519,7 @@ g + 0x15c0 = memsize[256]  (size_t[256] - per-memcat byte totals; init:
 // Roblox-specific large data blocks (extents from lua_newstate _bzero calls):
 g + 0x3400 = ???  (0x800 bytes zeroed - purpose unknown)                 [LOW]
 g + 0x3c00 = ???  (0x400 bytes zeroed - purpose unknown)                 [LOW]
-g + 0x4000 = ???  (0x410 bytes zeroed if FFlag::LuauStacklessPcall set)  [LOW]
+g + 0x4000 = ???  (0x410 bytes zeroed if feature flag at DAT_05fabf10 is set)  [LOW]
 
 // sizeof(global_State) ≈ 0x4690 (allocation is 0x4710; lua_State is 0x80)
 ```
