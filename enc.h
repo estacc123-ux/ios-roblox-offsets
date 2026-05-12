@@ -37,6 +37,27 @@
 #define LUA_CALLINFO_HANDLE (1 << 1)
 #define LUA_CALLINFO_NATIVE (1 << 2)
 
+
+
+#define TSTRING_HASH_ENC    // raw
+#define LSTATE_STACKSIZE_ENC // raw
+#define CLOSURE_CONT_ENC    // raw
+#define CLOSURE_DEBUGNAME_ENC // raw
+#define PROTO_LINEINFO_ENC  // raw
+#define PROTO_SOURCE_ENC    // raw
+#define PROTO_ABSLINEINFO_ENC // raw
+#define PROTO_UPVALUES_ENC  // raw
+#define PROTO_LOCVARS_ENC   // raw
+#define PROTO_DEBUGNAME_ENC // raw
+#define PROTO_DEBUGINSN_ENC // raw
+#define PROTO_TYPEINFO_ENC  // raw
+#define PROTO_USERDATA_ENC  // raw
+#define TABLE_META_ENC      // raw
+#define UDATA_META_ENC      // raw
+#define GSTATE_TTNAME_ENC   // raw
+#define GSTATE_TMNAME_ENC   // raw
+
+
 // TString
 
 struct TString {
